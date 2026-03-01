@@ -39,7 +39,7 @@ python server.py
 
 2. **访问 Web 界面**
 ```
-打开浏览器访问：http://localhost:8765
+打开浏览器访问：http://服务端IP:8765
 ```
 
 3. **开始控制**
