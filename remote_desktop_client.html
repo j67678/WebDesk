@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🖥️ Remote Desktop</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0d0d0d;
+    color: #e0e0e0;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── 顶部工具栏 ── */
+  #toolbar {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border-bottom: 1px solid #2a2a4a;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+    z-index: 100;
+    user-select: none;
+  }
+
+  #toolbar .logo {
+    font-size: 18px;
+    font-weight: 700;
+    color: #7c9ef5;
+    letter-spacing: -0.5px;
+    white-space: nowrap;
+  }
+
+  #toolbar .logo span { color: #a78bfa; }
+
+  .toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  #toolbar input[type="text"], #toolbar input[type="number"] {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    color: #e6edf3;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  #toolbar input[type="text"]:focus, #toolbar input[type="number"]:focus {
+    border-color: #7c9ef5;
+  }
+  #toolbar input[type="text"] { width: 200px; }
+  #toolbar input[type="number"] { width: 70px; }
+
+  .btn {
+    padding: 5px 14px;
+    border-radius: 6px;
+    border: none;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .btn-primary {
+    background: #1f6feb;
+    color: white;
+  }
+  .btn-primary:hover { background: #388bfd; }
+  .btn-danger {
+    background: #da3633;
+    color: white;
+  }
+  .btn-danger:hover { background: #f85149; }
+  .btn-secondary {
+    background: #21262d;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+  }
+  .btn-secondary:hover { background: #30363d; }
+
+  /* 状态指示灯 */
+  #status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #444;
+    transition: background 0.3s;
+    flex-shrink: 0;
+  }
+  #status-dot.connecting { background: #f0ad4e; animation: pulse 1s infinite; }
+  #status-dot.connected  { background: #3fb950; }
+  #status-dot.error      { background: #f85149; }
+
+  @keyframes pulse {
+    0%,100% { opacity: 1; } 50% { opacity: 0.3; }
+  }
+
+  #status-text {
+    font-size: 12px;
+    color: #8b949e;
+    min-width: 80px;
+  }
+
+  /* 统计信息 */
+  #stats {
+    font-size: 11px;
+    color: #6e7681;
+    margin-left: auto;
+    display: flex;
+    gap: 12px;
+  }
+  #stats span { white-space: nowrap; }
+
+  /* ── 主视图区域 ── */
+  #viewport {
+    flex: 1;
+    overflow: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #080808;
+    position: relative;
+  }
+
+  /* 画面小于视口时居中；大于视口时从左上角起可滚动 */
+  #canvas-wrapper {
+    position: relative;
+    display: inline-block;
+    cursor: none;
+    flex-shrink: 0;
+    margin: auto;
+  }
+
+  #screen-canvas {
+    display: block;
+    image-rendering: pixelated;
+    background: #111;
+  }
+
+  /* 自定义光标 */
+  #remote-cursor {
+    position: absolute;
+    width: 16px; height: 16px;
+    pointer-events: none;
+    z-index: 10;
+    transform: translate(-2px, -2px);
+  }
+
+  /* 连接提示覆盖层 */
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.85);
+    backdrop-filter: blur(4px);
+    z-index: 50;
+    gap: 16px;
+  }
+  #overlay.hidden { display: none; }
+
+  #overlay .icon { font-size: 64px; opacity: 0.5; }
+  #overlay .title {
+    font-size: 22px;
+    font-weight: 600;
+    color: #c9d1d9;
+  }
+  #overlay .subtitle {
+    font-size: 14px;
+    color: #6e7681;
+    max-width: 360px;
+    text-align: center;
+    line-height: 1.5;
+  }
+
+  /* 通知条 */
+  #notif {
+    position: fixed;
+    bottom: 16px; left: 50%;
+    transform: translateX(-50%);
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 8px 20px;
+    font-size: 13px;
+    color: #c9d1d9;
+    z-index: 200;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s;
+  }
+  #notif.show { opacity: 1; }
+
+  /* 缩放控制 - 移除 */
+
+  label {
+    font-size: 12px;
+    color: #8b949e;
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+
+<!-- ── 工具栏 ── -->
+<div id="toolbar">
+  <div class="logo">🖥️ Remote<span>Desktop</span></div>
+
+  <div class="toolbar-group">
+    <label>服务器</label>
+    <input type="text" id="host" value="" placeholder="主机地址">
+    <label>:</label>
+    <input type="number" id="port" value="8765" min="1" max="65535">
+  </div>
+
+  <button class="btn btn-primary" id="btn-connect" onclick="connect()">连接</button>
+  <button class="btn btn-danger" id="btn-disconnect" onclick="disconnect()" disabled>断开</button>
+  <button class="btn btn-secondary" onclick="requestFullRefresh()" title="强制全屏刷新">🔄 刷新</button>
+  <button class="btn btn-secondary" onclick="toggleFullscreen()" title="全屏">⛶ 全屏</button>
+
+  <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
+    <div id="status-dot"></div>
+    <span id="status-text">未连接</span>
+    <div id="stats">
+      <span id="stat-fps">FPS: -</span>
+      <span id="stat-tiles">Tiles: -</span>
+      <span id="stat-bw">BW: -</span>
+      <span id="stat-latency">Latency: -</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── 主视图 ── -->
+<div id="viewport">
+  <div id="canvas-wrapper">
+    <canvas id="screen-canvas"></canvas>
+
+    <!-- 自定义光标 SVG -->
+    <svg id="remote-cursor" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+      <polygon points="1,1 1,13 4,10 7,15 9,14 6,9 10,9" fill="white" stroke="black" stroke-width="1"/>
+    </svg>
+  </div>
+
+  <!-- 覆盖层 -->
+  <div id="overlay">
+    <div class="icon">🖥️</div>
+    <div class="title">远程桌面</div>
+    <div class="subtitle">输入服务器地址，点击"连接"开始远程控制。<br>请确保服务端已运行 remote_desktop_server.py</div>
+  </div>
+</div>
+
+<!-- 通知条 -->
+<div id="notif" id="notif"></div>
+
+
+<script>
+'use strict';
+
+// ── 状态 ──────────────────────────────────────────────────────────────────────
+let ws = null;
+let remoteWidth = 1920, remoteHeight = 1080;
+let zoom = 1.0;
+let isConnected = false;
+let isMouseDown = false;
+
+// 统计
+let frameCount = 0;
+let tileCount = 0;
+let byteCount = 0;
+let lastStatTime = performance.now();
+let latencyMs = 0;
+let pingStartTime = 0;
+
+// DOM refs
+const canvas = document.getElementById('screen-canvas');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const statusDot = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+const remoteCursor = document.getElementById('remote-cursor');
+const viewport = document.getElementById('viewport');
+const canvasWrapper = document.getElementById('canvas-wrapper');
+
+// ── 连接管理 ─────────────────────────────────────────────────────────────────
+function connect() {
+  const hostInput = document.getElementById('host').value.trim();
+  const host = hostInput || window.location.hostname || 'localhost';
+  const port = document.getElementById('port').value.trim() || '8765';
+  const url = `ws://${host}:${port}`;
+
+  if (ws) ws.close();
+
+  setStatus('connecting', `连接中 ${url}...`);
+  notify(`正在连接 ${url}`);
+
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    isConnected = true;
+    setStatus('connected', '已连接');
+    overlay.classList.add('hidden');
+    document.getElementById('btn-connect').disabled = true;
+    document.getElementById('btn-disconnect').disabled = false;
+    notify('连接成功 ✓');
+    startStatTimer();
+  };
+
+  ws.onclose = (e) => {
+    isConnected = false;
+    setStatus('error', `已断开 (${e.code})`);
+    overlay.classList.remove('hidden');
+    document.getElementById('btn-connect').disabled = false;
+    document.getElementById('btn-disconnect').disabled = true;
+    notify(`连接已断开`);
+  };
+
+  ws.onerror = () => {
+    setStatus('error', '连接错误');
+    notify('⚠️ WebSocket 连接失败，请检查服务端是否运行');
+  };
+
+  ws.onmessage = onMessage;
+}
+
+function disconnect() {
+  if (ws) ws.close(1000, 'User disconnect');
+}
+
+// ── 消息处理 ──────────────────────────────────────────────────────────────────
+function onMessage(evt) {
+  let data;
+  try {
+    data = JSON.parse(evt.data);
+  } catch (e) {
+    return;
+  }
+
+  if (data.type === 'init') {
+    remoteWidth = data.width;
+    remoteHeight = data.height;
+    canvas.width = remoteWidth;
+    canvas.height = remoteHeight;
+    // 连接后立即按比例适应浏览器可用空间
+    fitToWindow();
+    // 初始黑屏
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, remoteWidth, remoteHeight);
+    // 开始定期 ping 测量延迟
+    startPingTimer();
+    return;
+  }
+
+  if (data.type === 'pong') {
+    // 收到 pong 响应，计算往返延迟
+    if (pingStartTime > 0) {
+      latencyMs = Math.round(performance.now() - pingStartTime);
+      pingStartTime = 0;
+    }
+    return;
+  }
+
+  if (data.type === 'frame') {
+    const tiles = data.tiles || [];
+    frameCount++;
+    tileCount += tiles.length;
+
+    const renderTile = (tile) => {
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          ctx.drawImage(img, tile.x, tile.y, tile.w, tile.h);
+          resolve();
+        };
+        img.onerror = resolve;
+        const mime = tile.fmt === 'jpeg' ? 'image/jpeg' : 'image/png';
+        byteCount += tile.data.length * 0.75; // approx base64 decode size
+        img.src = `data:${mime};base64,${tile.data}`;
+      });
+    };
+
+    Promise.all(tiles.map(renderTile));
+    return;
+  }
+}
+
+// ── 输入事件 → WebSocket ──────────────────────────────────────────────────────
+function sendInput(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+// 将 canvas 上的坐标转换为远程坐标
+function toRemote(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: Math.round((clientX - rect.left) / zoom),
+    y: Math.round((clientY - rect.top) / zoom),
+  };
+}
+
+// 移动远程光标
+function updateCursor(cx, cy) {
+  const rect = canvas.getBoundingClientRect();
+  const lx = cx - rect.left;
+  const ly = cy - rect.top;
+  remoteCursor.style.left = lx + 'px';
+  remoteCursor.style.top = ly + 'px';
+}
+
+// 鼠标事件
+canvasWrapper.addEventListener('mousemove', (e) => {
+  const { x, y } = toRemote(e.clientX, e.clientY);
+  updateCursor(e.clientX, e.clientY);
+  sendInput({ type: 'mousemove', x, y });
+}, { passive: true });
+
+canvasWrapper.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  isMouseDown = true;
+  const { x, y } = toRemote(e.clientX, e.clientY);
+  sendInput({ type: 'mousedown', x, y, button: e.button });
+});
+
+canvasWrapper.addEventListener('mouseup', (e) => {
+  e.preventDefault();
+  isMouseDown = false;
+  const { x, y } = toRemote(e.clientX, e.clientY);
+  sendInput({ type: 'mouseup', x, y, button: e.button });
+});
+
+// 双击检测
+let lastClickTime = 0;
+let lastClickButton = -1;
+canvasWrapper.addEventListener('dblclick', (e) => {
+  e.preventDefault();
+  const { x, y } = toRemote(e.clientX, e.clientY);
+  sendInput({ type: 'dblclick', x, y, button: e.button });
+});
+
+canvasWrapper.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+});
+
+canvasWrapper.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const { x, y } = toRemote(e.clientX, e.clientY);
+  sendInput({ type: 'wheel', x, y, deltaX: e.deltaX, deltaY: e.deltaY });
+}, { passive: false });
+
+// 键盘事件 - 捕获全局键盘
+const PASSTHROUGH_KEYS = new Set([
+  'F5', 'F11', 'F12', // 可以考虑保留一些本地键
+]);
+
+document.addEventListener('keydown', (e) => {
+  if (!isConnected) return;
+  if (e.key === 'F11') { toggleFullscreen(); return; }
+  // 阻止大多数浏览器默认行为
+  if (!['F5'].includes(e.key)) e.preventDefault();
+  sendInput({ type: 'keydown', key: e.key, code: e.code });
+}, { passive: false });
+
+document.addEventListener('keyup', (e) => {
+  if (!isConnected) return;
+  if (e.key === 'F11') return;
+  e.preventDefault();
+  sendInput({ type: 'keyup', key: e.key, code: e.code });
+}, { passive: false });
+
+// 剪贴板 (Ctrl+V paste)
+document.addEventListener('paste', (e) => {
+  if (!isConnected) return;
+  const text = e.clipboardData.getData('text/plain');
+  if (text) {
+    sendInput({ type: 'paste', text });
+  }
+});
+
+// ── 自适应缩放（自动） ────────────────────────────────────────────────────────
+function fitToWindow() {
+  const vw = viewport.clientWidth;
+  const vh = viewport.clientHeight;
+  const z = Math.min(vw / remoteWidth, vh / remoteHeight);
+  zoom = Math.max(0.2, Math.min(4.0, z));
+  canvas.style.width = (remoteWidth * zoom) + 'px';
+  canvas.style.height = (remoteHeight * zoom) + 'px';
+  remoteCursor.style.width = (16 * zoom) + 'px';
+  remoteCursor.style.height = (16 * zoom) + 'px';
+}
+
+// 全屏 ──────────────────────────────────────────────────────────────────────
+function toggleFullscreen() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen();
+  } else {
+    document.exitFullscreen();
+  }
+}
+
+// ── 强制刷新 ──────────────────────────────────────────────────────────────────
+function requestFullRefresh() {
+  sendInput({ type: 'request_full' });
+  notify('已请求全屏刷新');
+}
+
+// ── 状态 / 通知 ───────────────────────────────────────────────────────────────
+function setStatus(state, text) {
+  statusDot.className = state;
+  statusText.textContent = text;
+}
+
+let notifTimer;
+function notify(msg) {
+  const el = document.getElementById('notif');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(notifTimer);
+  notifTimer = setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+// ── 统计定时器 ────────────────────────────────────────────────────────────────
+function startPingTimer() {
+  // 每秒发送一次 ping 来测量延迟
+  setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN && pingStartTime === 0) {
+      pingStartTime = performance.now();
+      sendInput({ type: 'ping' });
+    }
+  }, 1000);
+}
+
+function startStatTimer() {
+  setInterval(() => {
+    const now = performance.now();
+    const dt = (now - lastStatTime) / 1000;
+    lastStatTime = now;
+
+    const fps = (frameCount / dt).toFixed(1);
+    const tiles = (tileCount / dt).toFixed(0);
+    const bwKbps = (byteCount / dt / 1024).toFixed(0);
+
+    frameCount = 0;
+    tileCount = 0;
+    byteCount = 0;
+
+    document.getElementById('stat-fps').textContent = `FPS: ${fps}`;
+    document.getElementById('stat-tiles').textContent = `Tiles/s: ${tiles}`;
+    document.getElementById('stat-bw').textContent = `BW: ${bwKbps}KB/s`;
+    document.getElementById('stat-latency').textContent = `延迟: ${latencyMs}ms`;
+  }, 1000);
+}
+
+// ── 初始化 ────────────────────────────────────────────────────────────────────
+// 设置默认主机为当前页面的域名
+document.getElementById('host').placeholder = window.location.hostname || 'localhost';
+
+fitToWindow();
+// 窗口 resize 时自动重新适应
+window.addEventListener('resize', fitToWindow);
+
+// 初始 canvas 尺寸占位
+canvas.width = 1920;
+canvas.height = 1080;
+ctx.fillStyle = '#111';
+ctx.fillRect(0, 0, 1920, 1080);
+
+// 允许 Enter 触发连接
+document.getElementById('host').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+document.getElementById('port').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+</script>
+</body>
+</html>
