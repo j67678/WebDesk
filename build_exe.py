@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-打包脚本：将 remote_desktop_server.py + remote_desktop_client.html
+打包脚本：将 server.py + client.html
 打包成单个可执行文件（Windows: .exe / Linux/macOS: 无扩展名二进制）
 
 用法：
     python build_exe.py
 
 输出：
-    dist/RemoteDesktop[.exe]
+    dist/WebDesk[.exe]
 
 依赖：
     pip install pyinstaller
@@ -19,8 +19,8 @@ import os
 import shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SERVER_PY  = os.path.join(HERE, 'remote_desktop_server.py')
-CLIENT_HTML = os.path.join(HERE, 'remote_desktop_client.html')
+SERVER_PY  = os.path.join(HERE, 'server.py')
+CLIENT_HTML = os.path.join(HERE, 'client.html')
 
 
 def check_files():
@@ -46,7 +46,7 @@ def build():
 
     dist_dir  = os.path.join(HERE, 'dist')
     build_dir = os.path.join(HERE, 'build')
-    spec_file = os.path.join(HERE, 'RemoteDesktop.spec')
+    spec_file = os.path.join(HERE, 'WebDesk.spec')
 
     # 清理旧产物
     for d in [dist_dir, build_dir]:
@@ -62,7 +62,7 @@ def build():
     cmd = [
         sys.executable, '-m', 'PyInstaller',
         '--onefile',                          # 打包成单个文件
-        '--name', 'RemoteDesktop',            # 输出文件名
+        '--name', 'WebDesk',            # 输出文件名
         '--noconfirm',                        # 不询问覆盖
         '--clean',                            # 清理缓存
         # 将 HTML 客户端嵌入包内，运行时解压到 sys._MEIPASS
@@ -97,7 +97,7 @@ def build():
 
     # 找到输出文件
     ext = '.exe' if sys.platform == 'win32' else ''
-    output = os.path.join(dist_dir, f'RemoteDesktop{ext}')
+    output = os.path.join(dist_dir, f'WebDesk{ext}')
     if os.path.exists(output):
         size_mb = os.path.getsize(output) / 1024 / 1024
         print(f"\n✅ 打包成功！")
@@ -105,7 +105,7 @@ def build():
         print(f"   文件大小 : {size_mb:.1f} MB")
         print(f"\n使用方法：")
         print(f"   直接双击运行，或命令行执行：")
-        print(f"   ./dist/RemoteDesktop{ext}")
+        print(f"   ./dist/WebDesk{ext}")
     else:
         print(f"\n❌ 打包完成但找不到输出文件: {output}")
         sys.exit(1)

@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['D:\\Project\\webdesk\\remote_desktop_server.py'],
+    ['D:\\Project\\webdesk\\server.py'],
     pathex=[],
     binaries=[],
-    datas=[('D:\\Project\\webdesk\\remote_desktop_client.html', '.')],
+    datas=[('D:\\Project\\webdesk\\client.html', '.')],
     hiddenimports=['PIL._imagingtk', 'PIL.Image', 'mss', 'numpy', 'websockets', 'pynput.mouse', 'pynput.keyboard', 'pynput._util'],
     hookspath=[],
     hooksconfig={},
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='RemoteDesktop',
+    name='WebDesk',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

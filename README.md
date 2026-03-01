@@ -1,4 +1,4 @@
-# 🖥️ Remote Desktop - 远程桌面控制
+# 🖥️ WebDesk - 远程桌面控制
 
 一个轻量级的远程桌面控制解决方案，基于 WebSocket 实现实时屏幕共享和远程控制。
 
@@ -34,7 +34,7 @@ pip install websockets mss pillow pynput numpy
 
 1. **启动服务端**
 ```bash
-python remote_desktop_server.py
+python server.py
 ```
 
 2. **访问 Web 界面**
@@ -57,10 +57,10 @@ python build_exe.py
 2. **运行可执行文件**
 ```bash
 # Windows
-dist\RemoteDesktop.exe
+dist\WebDesk.exe
 
 # Linux/macOS
-./dist/RemoteDesktop
+./dist/WebDesk
 ```
 
 ## ⚙️ 配置说明
@@ -161,9 +161,9 @@ quality = 65
 ### 项目结构
 ```
 .
-├── remote_desktop_server.py    # 服务端主程序
-├── remote_desktop_client.html  # Web 客户端界面
-├── config.ini                  # 配置文件
+├── server.py                  # 服务端主程序
+├── client.html                # Web 客户端界面
+├── config.ini                 # 配置文件
 ├── build_exe.py               # 打包脚本
 └── README.md                  # 项目说明
 ```

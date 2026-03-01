@@ -117,13 +117,13 @@ def load_config(config_path='config.ini'):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 客户端 HTML 加载
-# 优先读同目录的 remote_desktop_client.html，否则用内嵌占位页
+# 优先读同目录的 client.html，否则用内嵌占位页
 # ═══════════════════════════════════════════════════════════════════════════════
 def _load_client_html(ws_port: int) -> bytes:
     """加载客户端 HTML，并将 WebSocket 地址注入为默认值"""
     # PyInstaller 打包后资源在 sys._MEIPASS，普通运行在脚本同目录
     base_dir = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    html_path = os.path.join(base_dir, 'remote_desktop_client.html')
+    html_path = os.path.join(base_dir, 'client.html')
 
     if os.path.exists(html_path):
         with open(html_path, 'r', encoding='utf-8') as f:
@@ -140,8 +140,8 @@ def _load_client_html(ws_port: int) -> bytes:
         log.warning(f"Client HTML not found at {html_path}, serving fallback page")
         return (
             f'<html><body style="font:16px sans-serif;padding:40px">'
-            f'<h2>Remote Desktop</h2>'
-            f'<p>找不到 <code>remote_desktop_client.html</code></p>'
+            f'<h2>WebDesk</h2>'
+            f'<p>找不到 <code>client.html</code></p>'
             f'<p>请将其放在与服务端同一目录下</p>'
             f'</body></html>'
         ).encode('utf-8')
@@ -491,7 +491,7 @@ class RemoteDesktopServer:
         )
 
         url = f"http://localhost:{self.port}/"
-        log.info(f"✅ Remote Desktop running!")
+        log.info(f"✅ WebDesk running!")
         log.info(f"   Web UI  : {url}")
         log.info(f"   WS      : ws://localhost:{self.port}/")
 
@@ -506,7 +506,7 @@ if __name__ == '__main__':
     config = load_config('config.ini')
     
     log.info("=" * 60)
-    log.info("Remote Desktop Server - Starting")
+    log.info("WebDesk Server - Starting")
     log.info("=" * 60)
     log.info(f"Configuration:")
     log.info(f"  Host: {config['host']}")
