@@ -490,26 +490,27 @@ class RemoteDesktopServer:
 # 启动入口
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    import argparse
-    
     # 加载配置文件
     config = load_config('config.ini')
     
-    parser = argparse.ArgumentParser(description='Remote Desktop Server')
-    parser.add_argument('--host',      default=config['host'], help=f"Bind address (default: {config['host']})")
-    parser.add_argument('--port',      type=int, default=int(config['port']), help=f"HTTP+WS port (default: {config['port']})")
-    parser.add_argument('--password',  default=config['password'], help='Access password (default: from config.ini)')
-    parser.add_argument('--fps',       type=int, default=int(config['fps']), help=f"Max FPS (default: {config['fps']})")
-    parser.add_argument('--tile-size', type=int, default=int(config['tile_size']), help=f"Tile size px (default: {config['tile_size']})")
-    parser.add_argument('--quality',   type=int, default=int(config['quality']), help=f"JPEG quality 1-95 (default: {config['quality']})")
-    args = parser.parse_args()
+    log.info("=" * 60)
+    log.info("Remote Desktop Server - Starting")
+    log.info("=" * 60)
+    log.info(f"Configuration:")
+    log.info(f"  Host: {config['host']}")
+    log.info(f"  Port: {config['port']}")
+    log.info(f"  Password: {'Enabled' if config['password'] else 'Disabled'}")
+    log.info(f"  FPS: {config['fps']}")
+    log.info(f"  Tile Size: {config['tile_size']}")
+    log.info(f"  Quality: {config['quality']}")
+    log.info("=" * 60)
 
     server = RemoteDesktopServer(
-        host=args.host,
-        port=args.port,
-        password=args.password,
-        fps=args.fps,
-        tile_size=args.tile_size,
-        quality=args.quality,
+        host=config['host'],
+        port=int(config['port']),
+        password=config['password'],
+        fps=int(config['fps']),
+        tile_size=int(config['tile_size']),
+        quality=int(config['quality']),
     )
     asyncio.run(server.start())
