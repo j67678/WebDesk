@@ -105,7 +105,7 @@ def build():
         print(f"   文件大小 : {size_mb:.1f} MB")
         print(f"\n使用方法：")
         print(f"   直接双击运行，或命令行执行：")
-        print(f"   ./dist/RemoteDesktop{ext} [--http-port 8080] [--ws-port 8765] [--fps 15]")
+        print(f"   ./dist/RemoteDesktop{ext}")
     else:
         print(f"\n❌ 打包完成但找不到输出文件: {output}")
         sys.exit(1)

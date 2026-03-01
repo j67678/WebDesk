@@ -77,15 +77,27 @@ def load_config(config_path='config.ini'):
         'quality': '75',
     }
     
-    if os.path.exists(config_path):
+    # 获取可执行文件所在目录
+    # PyInstaller 打包后，sys.executable 是可执行文件路径
+    # 开发环境下，使用脚本所在目录
+    if getattr(sys, 'frozen', False):
+        # 打包后的环境
+        exe_dir = os.path.dirname(sys.executable)
+    else:
+        # 开发环境
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    config_file = os.path.join(exe_dir, config_path)
+    
+    if os.path.exists(config_file):
         try:
-            config.read(config_path, encoding='utf-8')
-            log.info(f"Loaded config from: {config_path}")
+            config.read(config_file, encoding='utf-8')
+            log.info(f"Loaded config from: {config_file}")
         except Exception as e:
             log.warning(f"Failed to load config: {e}, using defaults")
             return defaults
     else:
-        log.info(f"Config file not found: {config_path}, using defaults")
+        log.info(f"Config file not found: {config_file}, using defaults")
         return defaults
     
     # 合并配置
