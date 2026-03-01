@@ -203,7 +203,82 @@
   }
   #notif.show { opacity: 1; }
 
-  /* 缩放控制 - 移除 */
+  /* 密码输入对话框 */
+  #auth-dialog {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.9);
+    backdrop-filter: blur(8px);
+    z-index: 9999;
+  }
+  #auth-dialog.show { display: flex; }
+
+  #auth-box {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid #2a2a4a;
+    border-radius: 12px;
+    padding: 24px;
+    min-width: 320px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+
+  #auth-box h3 {
+    margin: 0 0 16px 0;
+    font-size: 18px;
+    color: #e6edf3;
+    text-align: center;
+  }
+
+  #auth-box input[type="password"] {
+    width: 100%;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    color: #e6edf3;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 14px;
+    outline: none;
+    margin-bottom: 16px;
+    transition: border-color 0.2s;
+  }
+  #auth-box input[type="password"]:focus {
+    border-color: #7c9ef5;
+  }
+
+  #auth-box .auth-buttons {
+    display: flex;
+    gap: 8px;
+  }
+
+  #auth-box .auth-buttons button {
+    flex: 1;
+  }
+
+  #auth-error {
+    color: #f85149;
+    font-size: 12px;
+    margin-bottom: 12px;
+    text-align: center;
+    min-height: 16px;
+  }
+
+  #auth-box .remember-password {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: #8b949e;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  #auth-box .remember-password input[type="checkbox"] {
+    cursor: pointer;
+  }
 
   label {
     font-size: 12px;
@@ -264,6 +339,23 @@
 <!-- 通知条 -->
 <div id="notif" id="notif"></div>
 
+<!-- 密码验证对话框 -->
+<div id="auth-dialog">
+  <div id="auth-box">
+    <h3>🔒 需要密码验证</h3>
+    <div id="auth-error"></div>
+    <input type="password" id="auth-password" placeholder="请输入访问密码" autocomplete="off">
+    <label class="remember-password">
+      <input type="checkbox" id="remember-password">
+      <span>记住密码</span>
+    </label>
+    <div class="auth-buttons">
+      <button class="btn btn-secondary" onclick="cancelAuth()">取消</button>
+      <button class="btn btn-primary" onclick="submitAuth()">确认</button>
+    </div>
+  </div>
+</div>
+
 
 <script>
 'use strict';
@@ -274,6 +366,8 @@ let remoteWidth = 1920, remoteHeight = 1080;
 let zoom = 1.0;
 let isConnected = false;
 let isMouseDown = false;
+let requireAuth = false;
+let pendingAuthResolve = null;
 
 // 统计
 let frameCount = 0;
@@ -292,6 +386,51 @@ const statusText = document.getElementById('status-text');
 const remoteCursor = document.getElementById('remote-cursor');
 const viewport = document.getElementById('viewport');
 const canvasWrapper = document.getElementById('canvas-wrapper');
+const authDialog = document.getElementById('auth-dialog');
+const authPassword = document.getElementById('auth-password');
+const authError = document.getElementById('auth-error');
+const rememberPassword = document.getElementById('remember-password');
+
+// ── 本地存储密码管理 ──────────────────────────────────────────────────────────
+function getSavedPassword() {
+  try {
+    return localStorage.getItem('rdp_password') || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function savePassword(password) {
+  try {
+    localStorage.setItem('rdp_password', password);
+  } catch (e) {
+    console.warn('Failed to save password:', e);
+  }
+}
+
+function clearSavedPassword() {
+  try {
+    localStorage.removeItem('rdp_password');
+  } catch (e) {
+    console.warn('Failed to clear password:', e);
+  }
+}
+
+function isPasswordRemembered() {
+  try {
+    return localStorage.getItem('rdp_remember') === 'true';
+  } catch (e) {
+    return false;
+  }
+}
+
+function setPasswordRemembered(remember) {
+  try {
+    localStorage.setItem('rdp_remember', remember ? 'true' : 'false');
+  } catch (e) {
+    console.warn('Failed to save remember flag:', e);
+  }
+}
 
 // ── 连接管理 ─────────────────────────────────────────────────────────────────
 function connect() {
@@ -309,19 +448,16 @@ function connect() {
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
-    isConnected = true;
     setStatus('connected', '已连接');
-    overlay.classList.add('hidden');
-    document.getElementById('btn-connect').disabled = true;
-    document.getElementById('btn-disconnect').disabled = false;
-    notify('连接成功 ✓');
-    startStatTimer();
+    notify('连接成功，等待初始化...');
   };
 
   ws.onclose = (e) => {
     isConnected = false;
+    requireAuth = false;
     setStatus('error', `已断开 (${e.code})`);
     overlay.classList.remove('hidden');
+    authDialog.classList.remove('show');
     document.getElementById('btn-connect').disabled = false;
     document.getElementById('btn-disconnect').disabled = true;
     notify(`连接已断开`);
@@ -339,6 +475,65 @@ function disconnect() {
   if (ws) ws.close(1000, 'User disconnect');
 }
 
+// ── 密码验证 ──────────────────────────────────────────────────────────────────
+function showAuthDialog() {
+  authDialog.classList.add('show');
+  authError.textContent = '';
+  
+  // 加载保存的密码
+  if (isPasswordRemembered()) {
+    const saved = getSavedPassword();
+    authPassword.value = saved;
+    rememberPassword.checked = true;
+    // 如果有保存的密码，自动提交
+    if (saved) {
+      setTimeout(() => submitAuth(), 100);
+      return;
+    }
+  } else {
+    authPassword.value = '';
+    rememberPassword.checked = false;
+  }
+  
+  authPassword.focus();
+}
+
+function hideAuthDialog() {
+  authDialog.classList.remove('show');
+}
+
+function submitAuth() {
+  const password = authPassword.value;
+  if (!password) {
+    authError.textContent = '请输入密码';
+    return;
+  }
+  
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'auth', password: password }));
+    authError.textContent = '验证中...';
+    
+    // 保存密码设置
+    if (rememberPassword.checked) {
+      savePassword(password);
+      setPasswordRemembered(true);
+    } else {
+      clearSavedPassword();
+      setPasswordRemembered(false);
+    }
+  }
+}
+
+function cancelAuth() {
+  hideAuthDialog();
+  disconnect();
+}
+
+// 允许 Enter 提交密码
+authPassword.addEventListener('keydown', e => {
+  if (e.key === 'Enter') submitAuth();
+});
+
 // ── 消息处理 ──────────────────────────────────────────────────────────────────
 function onMessage(evt) {
   let data;
@@ -348,11 +543,51 @@ function onMessage(evt) {
     return;
   }
 
+  if (data.type === 'auth_result') {
+    if (data.success) {
+      authError.textContent = '';
+      hideAuthDialog();
+      notify('密码验证成功 ✓');
+      // 验证成功后激活连接
+      isConnected = true;
+      overlay.classList.add('hidden');
+      document.getElementById('btn-connect').disabled = true;
+      document.getElementById('btn-disconnect').disabled = false;
+      startStatTimer();
+    } else {
+      authError.textContent = data.message || '密码错误';
+      authPassword.value = '';
+      authPassword.focus();
+      // 密码错误时清除保存的密码
+      if (isPasswordRemembered()) {
+        clearSavedPassword();
+        setPasswordRemembered(false);
+        rememberPassword.checked = false;
+      }
+    }
+    return;
+  }
+
   if (data.type === 'init') {
     remoteWidth = data.width;
     remoteHeight = data.height;
     canvas.width = remoteWidth;
     canvas.height = remoteHeight;
+    
+    // 检查是否需要密码验证
+    if (data.require_auth) {
+      requireAuth = true;
+      showAuthDialog();
+    } else {
+      // 不需要密码，直接进入
+      isConnected = true;
+      overlay.classList.add('hidden');
+      document.getElementById('btn-connect').disabled = true;
+      document.getElementById('btn-disconnect').disabled = false;
+      notify('连接成功 ✓');
+      startStatTimer();
+    }
+    
     // 连接后立即按比例适应浏览器可用空间
     fitToWindow();
     // 初始黑屏

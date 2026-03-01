@@ -21,6 +21,7 @@ import threading
 import webbrowser
 import os
 import sys
+import configparser
 from http import HTTPStatus
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
@@ -57,6 +58,49 @@ try:
 except ImportError:
     PYNPUT_AVAILABLE = False
     log.warning("pynput not found, input injection disabled")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 配置文件加载
+# ═══════════════════════════════════════════════════════════════════════════════
+def load_config(config_path='config.ini'):
+    """加载配置文件，返回配置字典"""
+    config = configparser.ConfigParser()
+    
+    # 默认配置
+    defaults = {
+        'host': '0.0.0.0',
+        'port': '8765',
+        'password': '',
+        'fps': '15',
+        'tile_size': '64',
+        'quality': '75',
+    }
+    
+    if os.path.exists(config_path):
+        try:
+            config.read(config_path, encoding='utf-8')
+            log.info(f"Loaded config from: {config_path}")
+        except Exception as e:
+            log.warning(f"Failed to load config: {e}, using defaults")
+            return defaults
+    else:
+        log.info(f"Config file not found: {config_path}, using defaults")
+        return defaults
+    
+    # 合并配置
+    result = defaults.copy()
+    if config.has_section('server'):
+        for key in ['host', 'port', 'password']:
+            if config.has_option('server', key):
+                result[key] = config.get('server', key)
+    
+    if config.has_section('performance'):
+        for key in ['fps', 'tile_size', 'quality']:
+            if config.has_option('performance', key):
+                result[key] = config.get('performance', key)
+    
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -287,17 +331,20 @@ def handle_keyboard_event(data: dict):
 # 对普通 HTTP GET 返回 HTML，对 WS 升级请求正常走 WebSocket
 # ═══════════════════════════════════════════════════════════════════════════════
 class RemoteDesktopServer:
-    def __init__(self, host='0.0.0.0', port=8765,
+    def __init__(self, host='0.0.0.0', port=8765, password='',
                  fps=15, tile_size=64, quality=75, no_browser=False):
         self.host = host
         self.port = port
+        self.password = password.strip()
         self.fps = fps
         self.tile_size = tile_size
         self.quality = quality
         self.no_browser = no_browser
         self.capture = ScreenCapture()
-        # 预加载 HTML（注入端口号）
+        # 预加载 HTML（注入端口号和密码要求标志）
         self._html_bytes = _load_client_html(port)
+        # 已认证的客户端集合
+        self.authenticated_clients = set()
 
     # ── HTTP 钩子：拦截非 WebSocket 请求，返回客户端 HTML ──────────────────────
     async def _process_request(self, connection, request):
@@ -322,21 +369,42 @@ class RemoteDesktopServer:
     async def _ws_handler(self, websocket):
         client_addr = websocket.remote_address
         log.info(f"WS client connected: {client_addr}")
+        
         detector = DirtyRectDetector(tile_size=self.tile_size, threshold=3)
+        authenticated = not bool(self.password)  # 如果没有密码，默认已认证
 
+        # 先发送 init 消息，告知客户端是否需要密码
         await websocket.send(json.dumps({
             'type': 'init',
             'width': self.capture.width,
             'height': self.capture.height,
             'tile_size': self.tile_size,
+            'require_auth': bool(self.password),
         }))
 
         async def recv_loop():
+            nonlocal authenticated
             try:
                 async for message in websocket:
                     try:
                         data = json.loads(message)
                         etype = data.get('type', '')
+                        
+                        # 处理认证消息
+                        if etype == 'auth':
+                            if self.password and data.get('password') == self.password:
+                                authenticated = True
+                                await websocket.send(json.dumps({'type': 'auth_result', 'success': True}))
+                                log.info(f"Client {client_addr} authenticated successfully")
+                            else:
+                                await websocket.send(json.dumps({'type': 'auth_result', 'success': False, 'message': '密码错误'}))
+                                log.warning(f"Client {client_addr} authentication failed")
+                            continue
+                        
+                        # 如果需要密码但未认证，忽略其他消息
+                        if self.password and not authenticated:
+                            continue
+                        
                         if etype == 'ping':
                             # 立即响应 pong
                             await websocket.send(json.dumps({'type': 'pong'}))
@@ -360,6 +428,12 @@ class RemoteDesktopServer:
             try:
                 while True:
                     t0 = time.monotonic()
+                    
+                    # 如果需要密码但未认证，不发送帧数据
+                    if self.password and not authenticated:
+                        await asyncio.sleep(0.1)
+                        continue
+                    
                     try:
                         dirty = await loop.run_in_executor(None, grab_and_diff)
                         if dirty:
@@ -390,6 +464,7 @@ class RemoteDesktopServer:
     # ── 启动 ──────────────────────────────────────────────────────────────────
     async def start(self):
         log.info(f"FPS={self.fps}, TileSize={self.tile_size}, Quality={self.quality}")
+        log.info(f"Password: {'Enabled' if self.password else 'Disabled'}")
         log.info(f"pynput: {'OK' if PYNPUT_AVAILABLE else 'NOT AVAILABLE (read-only mode)'}")
         log.info(f"mss:    {'OK' if MSS_AVAILABLE else 'NOT AVAILABLE'}")
         log.info(f"numpy:  {'OK' if NUMPY_AVAILABLE else 'NOT AVAILABLE'}")
@@ -416,17 +491,23 @@ class RemoteDesktopServer:
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
     import argparse
+    
+    # 加载配置文件
+    config = load_config('config.ini')
+    
     parser = argparse.ArgumentParser(description='Remote Desktop Server')
-    parser.add_argument('--host',      default='0.0.0.0', help='Bind address (default: 0.0.0.0)')
-    parser.add_argument('--port',      type=int, default=8765, help='HTTP+WS port (default: 8765)')
-    parser.add_argument('--fps',       type=int, default=15,   help='Max FPS (default: 15)')
-    parser.add_argument('--tile-size', type=int, default=64,   help='Tile size px (default: 64)')
-    parser.add_argument('--quality',   type=int, default=75,   help='JPEG quality 1-95 (default: 75)')
+    parser.add_argument('--host',      default=config['host'], help=f"Bind address (default: {config['host']})")
+    parser.add_argument('--port',      type=int, default=int(config['port']), help=f"HTTP+WS port (default: {config['port']})")
+    parser.add_argument('--password',  default=config['password'], help='Access password (default: from config.ini)')
+    parser.add_argument('--fps',       type=int, default=int(config['fps']), help=f"Max FPS (default: {config['fps']})")
+    parser.add_argument('--tile-size', type=int, default=int(config['tile_size']), help=f"Tile size px (default: {config['tile_size']})")
+    parser.add_argument('--quality',   type=int, default=int(config['quality']), help=f"JPEG quality 1-95 (default: {config['quality']})")
     args = parser.parse_args()
 
     server = RemoteDesktopServer(
         host=args.host,
         port=args.port,
+        password=args.password,
         fps=args.fps,
         tile_size=args.tile_size,
         quality=args.quality,
