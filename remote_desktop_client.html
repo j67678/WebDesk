@@ -376,6 +376,8 @@ let byteCount = 0;
 let lastStatTime = performance.now();
 let latencyMs = 0;
 let pingStartTime = 0;
+let statTimerId = null;
+let pingTimerId = null;
 
 // DOM refs
 const canvas = document.getElementById('screen-canvas');
@@ -461,6 +463,8 @@ function connect() {
     document.getElementById('btn-connect').disabled = false;
     document.getElementById('btn-disconnect').disabled = true;
     notify(`连接已断开`);
+    // 清理定时器
+    stopTimers();
   };
 
   ws.onerror = () => {
@@ -549,11 +553,7 @@ function onMessage(evt) {
       hideAuthDialog();
       notify('密码验证成功 ✓');
       // 验证成功后激活连接
-      isConnected = true;
-      overlay.classList.add('hidden');
-      document.getElementById('btn-connect').disabled = true;
-      document.getElementById('btn-disconnect').disabled = false;
-      startStatTimer();
+      activateConnection();
     } else {
       authError.textContent = data.message || '密码错误';
       authPassword.value = '';
@@ -574,27 +574,20 @@ function onMessage(evt) {
     canvas.width = remoteWidth;
     canvas.height = remoteHeight;
     
+    // 连接后立即按比例适应浏览器可用空间
+    fitToWindow();
+    // 初始黑屏
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, remoteWidth, remoteHeight);
+    
     // 检查是否需要密码验证
     if (data.require_auth) {
       requireAuth = true;
       showAuthDialog();
     } else {
       // 不需要密码，直接进入
-      isConnected = true;
-      overlay.classList.add('hidden');
-      document.getElementById('btn-connect').disabled = true;
-      document.getElementById('btn-disconnect').disabled = false;
-      notify('连接成功 ✓');
-      startStatTimer();
+      activateConnection();
     }
-    
-    // 连接后立即按比例适应浏览器可用空间
-    fitToWindow();
-    // 初始黑屏
-    ctx.fillStyle = '#111';
-    ctx.fillRect(0, 0, remoteWidth, remoteHeight);
-    // 开始定期 ping 测量延迟
-    startPingTimer();
     return;
   }
 
@@ -768,18 +761,52 @@ function notify(msg) {
 }
 
 // ── 统计定时器 ────────────────────────────────────────────────────────────────
-function startPingTimer() {
-  // 每秒发送一次 ping 来测量延迟
-  setInterval(() => {
+function activateConnection() {
+  isConnected = true;
+  overlay.classList.add('hidden');
+  document.getElementById('btn-connect').disabled = true;
+  document.getElementById('btn-disconnect').disabled = false;
+  notify('连接成功 ✓');
+  startTimers();
+}
+
+function stopTimers() {
+  if (statTimerId) {
+    clearInterval(statTimerId);
+    statTimerId = null;
+  }
+  if (pingTimerId) {
+    clearInterval(pingTimerId);
+    pingTimerId = null;
+  }
+  // 重置统计数据
+  frameCount = 0;
+  tileCount = 0;
+  byteCount = 0;
+  latencyMs = 0;
+  document.getElementById('stat-fps').textContent = 'FPS: -';
+  document.getElementById('stat-tiles').textContent = 'Tiles: -';
+  document.getElementById('stat-bw').textContent = 'BW: -';
+  document.getElementById('stat-latency').textContent = '延迟: -';
+}
+
+function startTimers() {
+  // 先清理旧的定时器
+  stopTimers();
+  
+  // 重置统计时间
+  lastStatTime = performance.now();
+  
+  // 启动 ping 定时器
+  pingTimerId = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN && pingStartTime === 0) {
       pingStartTime = performance.now();
       sendInput({ type: 'ping' });
     }
   }, 1000);
-}
-
-function startStatTimer() {
-  setInterval(() => {
+  
+  // 启动统计定时器
+  statTimerId = setInterval(() => {
     const now = performance.now();
     const dt = (now - lastStatTime) / 1000;
     lastStatTime = now;
@@ -797,6 +824,15 @@ function startStatTimer() {
     document.getElementById('stat-bw').textContent = `BW: ${bwKbps}KB/s`;
     document.getElementById('stat-latency').textContent = `延迟: ${latencyMs}ms`;
   }, 1000);
+}
+
+// 旧函数保留以防兼容性问题
+function startPingTimer() {
+  // 已合并到 startTimers()
+}
+
+function startStatTimer() {
+  // 已合并到 startTimers()
 }
 
 // ── 初始化 ────────────────────────────────────────────────────────────────────
