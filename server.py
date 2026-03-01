@@ -310,8 +310,6 @@ def handle_mouse_event(data: dict):
             mouse_ctrl.position = (x, y); mouse_ctrl.press(btn)
         elif etype == 'mouseup':
             mouse_ctrl.position = (x, y); mouse_ctrl.release(btn)
-        elif etype == 'dblclick':
-            mouse_ctrl.position = (x, y); mouse_ctrl.click(btn, count=2)
         elif etype == 'wheel':
             dx, dy = int(data.get('deltaX', 0)), int(data.get('deltaY', 0))
             if dy: mouse_ctrl.scroll(0, -dy / 100)
@@ -420,7 +418,7 @@ class RemoteDesktopServer:
                         if etype == 'ping':
                             # 立即响应 pong
                             await websocket.send(json.dumps({'type': 'pong'}))
-                        elif etype.startswith('mouse') or etype in ('dblclick', 'wheel'):
+                        elif etype.startswith('mouse') or etype == 'wheel':
                             handle_mouse_event(data)
                         elif etype.startswith('key'):
                             handle_keyboard_event(data)

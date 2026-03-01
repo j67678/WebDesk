@@ -650,6 +650,9 @@ function updateCursor(cx, cy) {
 }
 
 // 鼠标事件
+let dblClickTimeout = null;
+let pendingClick = null;
+
 canvasWrapper.addEventListener('mousemove', (e) => {
   const { x, y } = toRemote(e.clientX, e.clientY);
   updateCursor(e.clientX, e.clientY);
@@ -670,13 +673,16 @@ canvasWrapper.addEventListener('mouseup', (e) => {
   sendInput({ type: 'mouseup', x, y, button: e.button });
 });
 
-// 双击检测
-let lastClickTime = 0;
-let lastClickButton = -1;
+// 双击事件 - 浏览器原生双击检测
 canvasWrapper.addEventListener('dblclick', (e) => {
   e.preventDefault();
   const { x, y } = toRemote(e.clientX, e.clientY);
-  sendInput({ type: 'dblclick', x, y, button: e.button });
+  // 双击时只发送双击事件，mousedown/mouseup 已经发送过了
+  // 服务端会收到：第一次点击的 down+up，第二次点击的 down+up，然后是这个 dblclick
+  // 但 pynput 的 click(count=2) 会再次执行完整的双击
+  // 所以我们不应该发送 dblclick，而是让 mousedown/mouseup 自然形成双击
+  // 因此注释掉这行
+  // sendInput({ type: 'dblclick', x, y, button: e.button });
 });
 
 canvasWrapper.addEventListener('contextmenu', (e) => {
