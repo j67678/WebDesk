@@ -17,6 +17,16 @@
     overflow: hidden;
   }
 
+  /* 全屏模式下隐藏工具栏 */
+  body.fullscreen-mode #toolbar {
+    display: none;
+  }
+
+  /* 全屏模式下禁止滚动条 */
+  body.fullscreen-mode #viewport {
+    overflow: hidden !important;
+  }
+
   /* ── 顶部工具栏 ── */
   #toolbar {
     background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
@@ -130,6 +140,15 @@
     justify-content: center;
     background: #080808;
     position: relative;
+  }
+
+  /* 全屏模式下视口占满整个屏幕 */
+  body.fullscreen-mode #viewport {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
   }
 
   /* 画面小于视口时居中；大于视口时从左上角起可滚动 */
@@ -744,6 +763,21 @@ function toggleFullscreen() {
     document.exitFullscreen();
   }
 }
+
+// 监听全屏状态变化
+document.addEventListener('fullscreenchange', () => {
+  if (document.fullscreenElement) {
+    // 进入全屏：隐藏工具栏，禁止滚动
+    document.body.classList.add('fullscreen-mode');
+    // 重新调整画布大小以适应全屏
+    fitToWindow();
+  } else {
+    // 退出全屏：显示工具栏，恢复滚动
+    document.body.classList.remove('fullscreen-mode');
+    // 重新调整画布大小
+    fitToWindow();
+  }
+});
 
 // ── 强制刷新 ──────────────────────────────────────────────────────────────────
 function requestFullRefresh() {
