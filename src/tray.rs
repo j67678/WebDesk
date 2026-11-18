@@ -1,12 +1,18 @@
 //! 系统托盘：Windows 使用原生 Shell_NotifyIcon（由 tray-icon 提供），
-//! 完全不需要 WebView2 / 浏览器运行时。菜单事件通过全局 channel 由 GUI 轮询。
+//! 完全不需要 WebView2 / 浏览器运行时。
+//!
+//! 托盘事件由独立线程轮询，而不是在 GUI 的 `update()` 里轮询：
+//! 窗口隐藏到托盘后 eframe 收不到重绘事件，`update()` 会暂停，
+//! 此时放在界面里的轮询将导致托盘菜单（尤其“显示主界面”）完全无响应。
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrayAction {
-    Show,
-    Start,
-    Stop,
-    Quit,
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 托盘“退出 WebDesk”被点击后置位，由 GUI 在恢复运行的那一帧完成优雅退出。
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// 取出并清除“退出”请求。
+pub fn take_quit_request() -> bool {
+    QUIT_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
 /// 生成 32×32 RGBA 图标：蓝色圆角底 + 白色显示器。
@@ -55,21 +61,28 @@ pub fn icon_rgba() -> Vec<u8> {
 
 #[cfg(any(windows, target_os = "macos"))]
 mod real {
-    use super::{icon_rgba, TrayAction};
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use eframe::egui::{Context, ViewportCommand};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+    use super::{icon_rgba, QUIT_REQUESTED};
+    use crate::config::Config;
+    use crate::server::{ServerHandle, StateKind};
+    use crate::{log_info, log_warn};
 
     pub struct Tray {
         _icon: TrayIcon,
         _menu: Menu,
-        show: MenuItem,
-        start: MenuItem,
-        stop: MenuItem,
-        quit: MenuItem,
     }
 
     impl Tray {
-        pub fn new() -> Option<Self> {
+        /// `ctx` 用于通过 egui 命令恢复窗口；`server` / `config_path` 让托盘菜单
+        /// 在窗口隐藏（GUI 循环暂停）时也能启停服务。
+        pub fn new(ctx: Context, server: ServerHandle, config_path: Option<PathBuf>) -> Option<Self> {
             let icon = Icon::from_rgba(icon_rgba(), 32, 32).ok()?;
             let menu = Menu::new();
             let show = MenuItem::new("显示主界面", true, None);
@@ -91,50 +104,86 @@ mod real {
             {
                 Ok(t) => t,
                 Err(e) => {
-                    crate::log_warn!("托盘图标创建失败（将退化为普通窗口）: {e}");
+                    log_warn!("托盘图标创建失败（将退化为普通窗口）: {e}");
                     return None;
                 }
             };
+
+            let show_id = show.id().clone();
+            let start_id = start.id().clone();
+            let stop_id = stop.id().clone();
+            let quit_id = quit.id().clone();
+            let thread_ctx = ctx.clone();
+            std::thread::Builder::new()
+                .name("webdesk-tray".into())
+                .spawn(move || loop {
+                    while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+                        let show_window = match ev {
+                            TrayIconEvent::DoubleClick {
+                                button: MouseButton::Left,
+                                ..
+                            } => true,
+                            // macOS 没有 DoubleClick 事件，左键单击也可唤出窗口
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            } => cfg!(target_os = "macos"),
+                            _ => false,
+                        };
+                        if show_window {
+                            reveal(&thread_ctx);
+                        }
+                    }
+                    while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                        if ev.id == show_id {
+                            reveal(&thread_ctx);
+                        } else if ev.id == start_id {
+                            start_service(&server, &config_path);
+                        } else if ev.id == stop_id {
+                            log_info!("托盘菜单：停止服务");
+                            server.stop();
+                        } else if ev.id == quit_id {
+                            log_info!("托盘菜单：退出 WebDesk");
+                            QUIT_REQUESTED.store(true, Ordering::SeqCst);
+                            // 隐藏的窗口收不到重绘事件，先恢复窗口让 GUI 主循环继续
+                            reveal(&thread_ctx);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                })
+                .ok();
+
             Some(Self {
                 _icon: tray_icon,
                 _menu: menu,
-                show,
-                start,
-                stop,
-                quit,
             })
         }
+    }
 
-        pub fn poll(&self) -> Vec<TrayAction> {
-            let mut out = Vec::new();
-            while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-                match ev {
-                    TrayIconEvent::DoubleClick {
-                        button: MouseButton::Left,
-                        ..
-                    } => out.push(TrayAction::Show),
-                    // macOS 没有 DoubleClick 事件，左键单击也可唤出窗口
-                    TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } if cfg!(target_os = "macos") => out.push(TrayAction::Show),
-                    _ => {}
-                }
+    /// 把主窗口恢复显示并置于前台（隐藏或最小化状态都能还原）。
+    fn reveal(ctx: &Context) {
+        #[cfg(windows)]
+        {
+            if crate::single_instance::show_main_window() {
+                return;
             }
-            while let Ok(ev) = MenuEvent::receiver().try_recv() {
-                if &ev.id == self.show.id() {
-                    out.push(TrayAction::Show);
-                } else if &ev.id == self.start.id() {
-                    out.push(TrayAction::Start);
-                } else if &ev.id == self.stop.id() {
-                    out.push(TrayAction::Stop);
-                } else if &ev.id == self.quit.id() {
-                    out.push(TrayAction::Quit);
-                }
-            }
-            out
         }
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+    }
+
+    fn start_service(server: &ServerHandle, config_path: &Option<PathBuf>) {
+        if matches!(
+            server.status().kind,
+            StateKind::Running | StateKind::Starting
+        ) {
+            log_info!("托盘菜单：服务已在运行");
+            return;
+        }
+        let cfg = Config::load(config_path.as_deref()).clamped();
+        log_info!("托盘菜单：启动服务（端口 {}）", cfg.port);
+        server.start(&cfg);
     }
 }
 
@@ -146,10 +195,11 @@ pub struct Tray;
 
 #[cfg(not(any(windows, target_os = "macos")))]
 impl Tray {
-    pub fn new() -> Option<Self> {
+    pub fn new(
+        _ctx: eframe::egui::Context,
+        _server: crate::server::ServerHandle,
+        _config_path: Option<std::path::PathBuf>,
+    ) -> Option<Self> {
         None
-    }
-    pub fn poll(&self) -> Vec<TrayAction> {
-        Vec::new()
     }
 }

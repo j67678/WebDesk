@@ -11,7 +11,7 @@ use eframe::{App, CreationContext, Frame, NativeOptions};
 
 use crate::config::{self, Config};
 use crate::server::{ServerController, StateKind, Status};
-use crate::tray::{self, Tray, TrayAction};
+use crate::tray::{self, Tray};
 use crate::{log_error, log_info, log_warn};
 
 /// 主窗口标题；单实例模式按此标题查找已运行实例的窗口。
@@ -104,7 +104,6 @@ struct WebDeskApp {
     tray: Option<Tray>,
     status: Status,
     tab: Tab,
-    visible: bool,
     really_quit: bool,
     confirm_exit: bool,
     password_new: String,
@@ -133,7 +132,11 @@ impl WebDeskApp {
         cfg.autostart = config::autostart_enabled();
 
         let controller = ServerController::new();
-        let tray = Tray::new();
+        let tray = Tray::new(
+            cc.egui_ctx.clone(),
+            controller.handle(),
+            opts.config_path.clone(),
+        );
         if tray.is_none() {
             log_warn!("系统托盘不可用，关闭窗口将直接退出程序");
         }
@@ -172,7 +175,6 @@ impl WebDeskApp {
             tray,
             status: Status::default(),
             tab: Tab::Service,
-            visible,
             really_quit: false,
             confirm_exit: false,
             password_new: String::new(),
@@ -196,15 +198,8 @@ impl WebDeskApp {
         }
     }
 
-    fn show_window(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(ViewportCommand::Focus);
-        self.visible = true;
-    }
-
     fn hide_window(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-        self.visible = false;
         log_info!("已最小化到系统托盘，服务继续在后台运行");
     }
 
@@ -288,26 +283,13 @@ impl WebDeskApp {
 
 impl App for WebDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // 托盘的“退出”请求由后台线程置位，这里完成优雅退出
+        if tray::take_quit_request() {
+            self.quit(ctx);
+            return;
+        }
         ctx.request_repaint_after(Duration::from_millis(200));
         self.status = self.controller.status();
-
-        // ── 托盘事件 ────────────────────────────────────────────────
-        if let Some(tray) = &self.tray {
-            for action in tray.poll() {
-                match action {
-                    TrayAction::Show => self.show_window(ctx),
-                    TrayAction::Start => {
-                        self.controller.start(&self.cfg);
-                        self.notify("正在启动服务…", false);
-                    }
-                    TrayAction::Stop => {
-                        self.controller.stop();
-                        self.notify("正在停止服务…", false);
-                    }
-                    TrayAction::Quit => self.quit(ctx),
-                }
-            }
-        }
 
         // ── 关闭窗口 → 最小化到托盘 ────────────────────────────────
         if ctx.input(|i| i.viewport().close_requested()) && !self.really_quit {

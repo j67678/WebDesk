@@ -56,17 +56,9 @@ mod imp {
     /// 把已运行实例的主窗口显示到前台。
     /// 对方为无界面模式（没有窗口）时等待超时后返回 `false`。
     pub fn activate_existing_window() -> bool {
-        let title = wide(crate::gui::WINDOW_TITLE);
         let deadline = Instant::now() + super::ACTIVATE_TIMEOUT;
         loop {
-            let hwnd = unsafe { FindWindowW(ptr::null(), title.as_ptr()) };
-            if !hwnd.is_null() {
-                unsafe {
-                    // 最小化到托盘的窗口是隐藏状态，先 SW_SHOW 再 SW_RESTORE
-                    ShowWindow(hwnd, SW_SHOW);
-                    ShowWindow(hwnd, SW_RESTORE);
-                    bring_to_front(hwnd);
-                }
+            if show_main_window() {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -74,6 +66,23 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// 立即把主窗口显示、还原并置于前台；找不到窗口（或尚未创建）时返回 `false`。
+    /// 托盘线程也用它来恢复隐藏到托盘的窗口。
+    pub fn show_main_window() -> bool {
+        let title = wide(crate::gui::WINDOW_TITLE);
+        let hwnd = unsafe { FindWindowW(ptr::null(), title.as_ptr()) };
+        if hwnd.is_null() {
+            return false;
+        }
+        unsafe {
+            // 最小化到托盘的窗口是隐藏状态，先 SW_SHOW 再 SW_RESTORE
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_RESTORE);
+            bring_to_front(hwnd);
+        }
+        true
     }
 
     /// `SetForegroundWindow` 受前台锁定限制，附加到当前前台线程的输入队列后更可靠。
@@ -107,6 +116,10 @@ mod imp {
     pub fn activate_existing_window() -> bool {
         false
     }
+
+    pub fn show_main_window() -> bool {
+        false
+    }
 }
 
-pub use imp::{acquire, activate_existing_window};
+pub use imp::{acquire, activate_existing_window, show_main_window};

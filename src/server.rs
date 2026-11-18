@@ -193,6 +193,35 @@ impl ServerController {
             let _ = handle.join();
         }
     }
+
+    /// 取得可跨线程使用的控制句柄（托盘线程等外部入口使用）。
+    pub fn handle(&self) -> ServerHandle {
+        ServerHandle {
+            cmd_tx: self.cmd_tx.clone(),
+            status: self.status.clone(),
+        }
+    }
+}
+
+/// 轻量控制句柄：只持有命令发送端与状态快照，可克隆到任意线程。
+#[derive(Clone)]
+pub struct ServerHandle {
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    status: Arc<Mutex<Status>>,
+}
+
+impl ServerHandle {
+    pub fn status(&self) -> Status {
+        lock_status(&self.status).clone()
+    }
+
+    pub fn start(&self, cfg: &Config) {
+        let _ = self.cmd_tx.send(Command::Start(ServerConfig::from(cfg)));
+    }
+
+    pub fn stop(&self) {
+        let _ = self.cmd_tx.send(Command::Stop);
+    }
 }
 
 impl Drop for ServerController {
