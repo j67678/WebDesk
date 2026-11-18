@@ -243,6 +243,10 @@ async fn command_loop(mut rx: mpsc::UnboundedReceiver<Command>, status: Arc<Mute
         match cmd {
             Command::Start(cfg) => {
                 stop_running(&mut running).await;
+                // 未设置密码时服务仍可启动，但客户端一律拒绝连接
+                if cfg.password_hash.is_empty() && cfg.password_plain.is_empty() {
+                    log_warn!("未设置访问密码：客户端将无法连接，请在界面中设置密码");
+                }
                 {
                     let mut c = creds.write().await;
                     c.hash = cfg.password_hash.clone();
@@ -525,6 +529,11 @@ async fn not_found() -> (StatusCode, &'static str) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    // 安全底线：未设置访问密码时不接受任何客户端连接
+    if !state.creds.read().await.required() {
+        log_warn!("未设置访问密码，已拒绝客户端连接");
+        return (StatusCode::FORBIDDEN, "未设置访问密码，客户端无法连接").into_response();
+    }
     // 输入消息只有几十字节；限制帧大小，避免超大帧吃掉内存
     ws.max_message_size(256 * 1024)
         .max_frame_size(256 * 1024)

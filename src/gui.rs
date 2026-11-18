@@ -26,7 +26,6 @@ pub struct GuiOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Service,
-    Security,
     Performance,
     General,
     Logs,
@@ -107,6 +106,7 @@ struct WebDeskApp {
     confirm_exit: bool,
     password_new: String,
     password_confirm: String,
+    password_error: Option<String>,
     show_password: bool,
     logs: Vec<String>,
     log_revision: u64,
@@ -154,10 +154,10 @@ impl WebDeskApp {
             })
             .ok();
 
-        if !opts.no_start {
-            controller.start(&cfg);
-        } else {
+        if opts.no_start {
             log_info!("已按 --no-start 跳过自动启动服务");
+        } else {
+            controller.start(&cfg);
         }
 
         Self {
@@ -173,6 +173,7 @@ impl WebDeskApp {
             confirm_exit: false,
             password_new: String::new(),
             password_confirm: String::new(),
+            password_error: None,
             show_password: false,
             logs: Vec::new(),
             log_revision: 0,
@@ -246,12 +247,13 @@ impl WebDeskApp {
     }
 
     fn set_password(&mut self) {
+        self.password_error = None;
         if self.password_new.is_empty() {
-            self.notify("请输入新密码", true);
+            self.password_error = Some("请输入新密码".into());
             return;
         }
         if self.password_new != self.password_confirm {
-            self.notify("两次输入的密码不一致", true);
+            self.password_error = Some("两次输入的密码不一致".into());
             return;
         }
         let hash = config::hash_password(&self.password_new);
@@ -261,15 +263,6 @@ impl WebDeskApp {
         self.password_confirm.clear();
         self.apply_settings();
         self.notify("访问密码已设置（PBKDF2-SHA256 加盐存储）", false);
-    }
-
-    fn clear_password(&mut self) {
-        self.cfg.password_hash.clear();
-        self.cfg.password_plain.clear();
-        self.password_new.clear();
-        self.password_confirm.clear();
-        self.apply_settings();
-        self.notify("访问密码已清除", false);
     }
 
     fn open_browser(&mut self) {
@@ -346,7 +339,6 @@ impl App for WebDeskApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("🖥 WebDesk").size(20.0).strong().color(Color32::from_rgb(124, 158, 245)));
-                ui.label(RichText::new("Rust 版 · 远程桌面").size(12.0).color(Color32::GRAY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (dot, label, color) = match self.status.kind {
                         StateKind::Running => ("●", "运行中", Color32::from_rgb(63, 185, 80)),
@@ -410,7 +402,6 @@ impl App for WebDeskApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Service, "服务");
-                ui.selectable_value(&mut self.tab, Tab::Security, "安全");
                 ui.selectable_value(&mut self.tab, Tab::Performance, "性能");
                 ui.selectable_value(&mut self.tab, Tab::General, "常规");
                 ui.selectable_value(&mut self.tab, Tab::Logs, "日志");
@@ -420,7 +411,6 @@ impl App for WebDeskApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.tab {
                     Tab::Service => self.service_tab(ui),
-                    Tab::Security => self.security_tab(ui),
                     Tab::Performance => self.performance_tab(ui),
                     Tab::General => self.general_tab(ui),
                     Tab::Logs => self.logs_tab(ui),
@@ -446,11 +436,115 @@ impl App for WebDeskApp {
                     });
                 });
         }
+
+        // ── 未设置密码：弹出强制设置提示 ────────────────────────────
+        if !self.cfg.auth_required() {
+            egui::Window::new("需要设置访问密码")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("为保证安全，未设置访问密码时客户端将无法连接，请先设置密码。")
+                            .color(Color32::from_rgb(248, 81, 73)),
+                    );
+                    ui.add_space(10.0);
+                    egui::Grid::new("password_modal_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("新密码");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.password_new)
+                                    .password(!self.show_password)
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+                            ui.label("确认密码");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.password_confirm)
+                                    .password(!self.show_password)
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+                        });
+                    ui.checkbox(&mut self.show_password, "显示密码");
+                    if let Some(err) = &self.password_error {
+                        ui.label(RichText::new(err).color(Color32::from_rgb(248, 81, 73)));
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("设置密码").clicked() {
+                        self.set_password();
+                    }
+                });
+        }
     }
 }
 
 impl WebDeskApp {
     fn service_tab(&mut self, ui: &mut egui::Ui) {
+        // ── 访问密码（必填，放在首页） ──────────────────────────────
+        ui.heading("访问密码");
+        ui.add_space(6.0);
+        let enabled = self.cfg.auth_required();
+        ui.horizontal(|ui| {
+            ui.label("当前状态：");
+            ui.label(
+                RichText::new(if enabled { "🔒 已启用" } else { "🔓 未设置" })
+                    .color(if enabled {
+                        Color32::from_rgb(63, 185, 80)
+                    } else {
+                        Color32::from_rgb(248, 81, 73)
+                    })
+                    .strong(),
+            );
+        });
+        if !enabled {
+            ui.label(
+                RichText::new("为保证安全，未设置访问密码时客户端将无法连接")
+                    .color(Color32::from_rgb(248, 81, 73))
+                    .strong(),
+            );
+        }
+        ui.add_space(8.0);
+        egui::Grid::new("password_grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("新密码");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.password_new)
+                        .password(!self.show_password)
+                        .hint_text(if enabled { "留空表示不修改" } else { "请设置访问密码" })
+                        .desired_width(260.0),
+                );
+                ui.end_row();
+                ui.label("确认密码");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.password_confirm)
+                        .password(!self.show_password)
+                        .desired_width(260.0),
+                );
+                ui.end_row();
+            });
+        ui.checkbox(&mut self.show_password, "显示密码");
+        ui.add_space(8.0);
+        if ui.button("设置 / 修改密码").clicked() {
+            self.set_password();
+        }
+        if let Some(err) = &self.password_error {
+            ui.label(RichText::new(err).color(Color32::from_rgb(248, 81, 73)));
+        }
+        ui.add_space(8.0);
+        ui.label("· 密码以 PBKDF2-SHA256（120000 次迭代 + 随机盐）哈希保存，不存明文");
+        ui.label("· 未通过验证的连接不会收到任何画面，也不会被允许注入输入");
+        ui.label("· 连续 8 次验证失败会断开连接，并采用指数退避抵御暴力破解");
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // ── 服务设置 ────────────────────────────────────────────────
         ui.heading("服务设置");
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -458,8 +552,6 @@ impl WebDeskApp {
             ui.add(egui::DragValue::new(&mut self.cfg.port).range(1..=65535).speed(1.0));
             ui.label(RichText::new("1 - 65535").color(Color32::GRAY));
         });
-        ui.add_space(4.0);
-        ui.label(RichText::new("同时监听 IPv4（0.0.0.0）与 IPv6（[::]），两个 socket 独立绑定同一端口").color(Color32::GRAY));
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(6.0);
@@ -470,9 +562,10 @@ impl WebDeskApp {
             }
         });
         if self.status.urls.is_empty() {
-            ui.label(RichText::new("服务启动后在此显示可用的 IPv4 / IPv6 地址").color(Color32::GRAY));
+            ui.label(RichText::new("服务启动后在此显示可用的访问地址").color(Color32::GRAY));
         }
-        for url in self.status.urls.clone() {            ui.horizontal(|ui| {
+        for url in self.status.urls.clone() {
+            ui.horizontal(|ui| {
                 ui.monospace(&url);
                 if ui.small_button("复制").clicked() {
                     ui.output_mut(|o| o.copied_text = url.clone());
@@ -492,63 +585,6 @@ impl WebDeskApp {
         ));
         ui.add_space(6.0);
         ui.label(RichText::new("提示：修改端口 / 性能参数后点击「保存并应用」，服务会自动重启；修改密码则即时生效，无需重启。").color(Color32::GRAY));
-    }
-
-    fn security_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("访问密码");
-        ui.add_space(6.0);
-        let enabled = self.cfg.auth_required();
-        ui.horizontal(|ui| {
-            ui.label("当前状态：");
-            ui.label(
-                RichText::new(if enabled { "🔒 已启用" } else { "🔓 未启用（任何人可连接）" })
-                    .color(if enabled {
-                        Color32::from_rgb(63, 185, 80)
-                    } else {
-                        Color32::from_rgb(240, 173, 78)
-                    })
-                    .strong(),
-            );
-        });
-        ui.add_space(8.0);
-        egui::Grid::new("password_grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("新密码");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.password_new)
-                        .password(!self.show_password)
-                        .hint_text("留空表示不修改")
-                        .desired_width(260.0),
-                );
-                ui.end_row();
-                ui.label("确认密码");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.password_confirm)
-                        .password(!self.show_password)
-                        .desired_width(260.0),
-                );
-                ui.end_row();
-            });
-        ui.checkbox(&mut self.show_password, "显示密码");
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("设置 / 修改密码").clicked() {
-                self.set_password();
-            }
-            if ui.add_enabled(enabled, egui::Button::new("清除密码")).clicked() {
-                self.clear_password();
-            }
-        });
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.label("· 密码以 PBKDF2-SHA256（120000 次迭代 + 随机盐）哈希保存，不存明文");
-        ui.label("· 未通过验证的连接不会收到任何画面，也不会被允许注入输入");
-        ui.label("· 连续 8 次验证失败会断开连接，并采用指数退避抵御暴力破解");
-        ui.label("· 修改后立即生效，已连接的客户端不受影响");
-        ui.label(RichText::new("· 服务仅在局域网 / 可信网络中使用，公网访问建议配合 VPN").color(Color32::GRAY));
     }
 
     fn performance_tab(&mut self, ui: &mut egui::Ui) {

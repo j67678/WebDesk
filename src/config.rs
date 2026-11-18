@@ -129,7 +129,7 @@ impl Config {
              [server]\n\
              # 监听端口 (1-65535)\n\
              port = {port}\n\
-             # 访问密码哈希（PBKDF2-SHA256，留空表示不需要密码）\n\
+             # 访问密码哈希（PBKDF2-SHA256；必须设置，否则客户端无法连接）\n\
              password_hash = {hash}\n\
              # 兼容旧版明文密码，建议清空并改用上面的哈希\n\
              password = {plain}\n\
