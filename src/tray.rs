@@ -4,7 +4,6 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayAction {
     Show,
-    OpenBrowser,
     Start,
     Stop,
     Quit,
@@ -64,7 +63,6 @@ mod real {
         _icon: TrayIcon,
         _menu: Menu,
         show: MenuItem,
-        browser: MenuItem,
         start: MenuItem,
         stop: MenuItem,
         quit: MenuItem,
@@ -75,13 +73,10 @@ mod real {
             let icon = Icon::from_rgba(icon_rgba(), 32, 32).ok()?;
             let menu = Menu::new();
             let show = MenuItem::new("显示主界面", true, None);
-            let browser = MenuItem::new("打开浏览器", true, None);
             let start = MenuItem::new("启动服务", true, None);
             let stop = MenuItem::new("停止服务", true, None);
             let quit = MenuItem::new("退出 WebDesk", true, None);
-            for item in [&show, &browser] {
-                menu.append(item).ok()?;
-            }
+            menu.append(&show).ok()?;
             menu.append(&PredefinedMenuItem::separator()).ok()?;
             menu.append(&start).ok()?;
             menu.append(&stop).ok()?;
@@ -104,7 +99,6 @@ mod real {
                 _icon: tray_icon,
                 _menu: menu,
                 show,
-                browser,
                 start,
                 stop,
                 quit,
@@ -131,8 +125,6 @@ mod real {
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if &ev.id == self.show.id() {
                     out.push(TrayAction::Show);
-                } else if &ev.id == self.browser.id() {
-                    out.push(TrayAction::OpenBrowser);
                 } else if &ev.id == self.start.id() {
                     out.push(TrayAction::Start);
                 } else if &ev.id == self.stop.id() {

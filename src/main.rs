@@ -32,8 +32,8 @@ mod input;
 mod logger;
 mod protocol;
 mod server;
+mod single_instance;
 mod tray;
-
 use std::path::PathBuf;
 
 use config::Config;
@@ -124,6 +124,19 @@ fn main() {
     globals::set_verbose(args.verbose);
     logger::init(Some(config::log_path()));
     log_info!("WebDesk 2.0.0 (Rust) 启动 | 日志: {}", logger::path_string());
+
+    // 单实例：已有实例在运行时唤起它的主窗口，避免重复监听端口
+    let _instance = match single_instance::acquire() {
+        Some(guard) => guard,
+        None => {
+            if !args.headless && single_instance::activate_existing_window() {
+                log_info!("检测到 WebDesk 已在运行，已唤起其主窗口，本次启动退出");
+            } else {
+                log_warn!("检测到 WebDesk 已在运行（无界面模式或窗口尚未就绪），本次启动退出");
+            }
+            return;
+        }
+    };
 
     if args.headless {
         run_headless(args);

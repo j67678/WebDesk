@@ -10,6 +10,7 @@ WebDesk 是一个用 Rust 实现的远程桌面服务端：本机运行一个桌
 - 完整输入：鼠标、滚轮、键盘、组合键、中文与 emoji 文本注入
 - 桌面 GUI：服务控制、密码管理、性能调节、运行日志与系统托盘
 - 单文件部署：`cargo build --release` 产出单个 `webdesk.exe`
+- 单实例运行：重复启动不会重复监听端口，而是唤起已运行实例的主界面
 - 无 WebView 依赖：GUI 使用 egui/glow（OpenGL）渲染
 
 ## 系统要求
@@ -101,6 +102,7 @@ Web 界面快捷键：`F11` 切换全屏，`Ctrl+V` 粘贴文本到远程桌面�
     ├── input.rs         # 键鼠输入注入与按键防粘滞
     ├── protocol.rs      # 客户端消息协议
     ├── config.rs        # 配置、密码哈希、开机自启、访问地址
+    ├── single_instance.rs # 单实例约束与唤起已运行实例主窗口
     ├── logger.rs        # 内存 + 文件日志
     ├── tray.rs          # 系统托盘
     └── globals.rs       # 全局运行开关

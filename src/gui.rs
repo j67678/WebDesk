@@ -14,6 +14,9 @@ use crate::server::{ServerController, StateKind, Status};
 use crate::tray::{self, Tray, TrayAction};
 use crate::{log_error, log_info, log_warn};
 
+/// 主窗口标题；单实例模式按此标题查找已运行实例的窗口。
+pub const WINDOW_TITLE: &str = "WebDesk · 远程桌面";
+
 #[derive(Clone, Debug, Default)]
 pub struct GuiOptions {
     pub minimized: bool,
@@ -45,7 +48,7 @@ pub fn run(opts: GuiOptions) -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "WebDesk · 远程桌面",
+        WINDOW_TITLE,
         native,
         Box::new(move |cc| Ok(Box::new(WebDeskApp::new(cc, opts)))),
     )
@@ -108,6 +111,7 @@ struct WebDeskApp {
     password_confirm: String,
     password_error: Option<String>,
     show_password: bool,
+    password_warning_dismissed: bool,
     logs: Vec<String>,
     log_revision: u64,
     last_log_check: Instant,
@@ -175,6 +179,7 @@ impl WebDeskApp {
             password_confirm: String::new(),
             password_error: None,
             show_password: false,
+            password_warning_dismissed: false,
             logs: Vec::new(),
             log_revision: 0,
             last_log_check: Instant::now(),
@@ -291,7 +296,6 @@ impl App for WebDeskApp {
             for action in tray.poll() {
                 match action {
                     TrayAction::Show => self.show_window(ctx),
-                    TrayAction::OpenBrowser => self.open_browser(),
                     TrayAction::Start => {
                         self.controller.start(&self.cfg);
                         self.notify("正在启动服务…", false);
@@ -353,6 +357,26 @@ impl App for WebDeskApp {
             ui.add_space(4.0);
         });
 
+        // ── 未设置密码：可关闭的提示条（不再强制弹窗）──────────────
+        if !self.cfg.auth_required() && !self.password_warning_dismissed {
+            egui::TopBottomPanel::top("password_warning").show(ctx, |ui| {
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("⚠ 为保证安全，请设置访问密码！")
+                            .color(Color32::from_rgb(248, 81, 73))
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").on_hover_text("关闭提示").clicked() {
+                            self.password_warning_dismissed = true;
+                        }
+                    });
+                });
+                ui.add_space(5.0);
+            });
+        }
+
         // ── 底部工具栏 ──────────────────────────────────────────────
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -372,9 +396,6 @@ impl App for WebDeskApp {
                 if ui.button("🔄 重启").clicked() {
                     self.controller.restart(&self.cfg);
                     self.notify("正在重启服务…", false);
-                }
-                if ui.button("🌐 打开浏览器").clicked() {
-                    self.open_browser();
                 }
                 if ui.button("⬇ 最小化到托盘").clicked() && self.tray.is_some() {
                     self.hide_window(ctx);
@@ -434,48 +455,6 @@ impl App for WebDeskApp {
                             self.confirm_exit = false;
                         }
                     });
-                });
-        }
-
-        // ── 未设置密码：弹出强制设置提示 ────────────────────────────
-        if !self.cfg.auth_required() {
-            egui::Window::new("需要设置访问密码")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label(
-                        RichText::new("为保证安全，未设置访问密码时客户端将无法连接，请先设置密码。")
-                            .color(Color32::from_rgb(248, 81, 73)),
-                    );
-                    ui.add_space(10.0);
-                    egui::Grid::new("password_modal_grid")
-                        .num_columns(2)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("新密码");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.password_new)
-                                    .password(!self.show_password)
-                                    .desired_width(220.0),
-                            );
-                            ui.end_row();
-                            ui.label("确认密码");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.password_confirm)
-                                    .password(!self.show_password)
-                                    .desired_width(220.0),
-                            );
-                            ui.end_row();
-                        });
-                    ui.checkbox(&mut self.show_password, "显示密码");
-                    if let Some(err) = &self.password_error {
-                        ui.label(RichText::new(err).color(Color32::from_rgb(248, 81, 73)));
-                    }
-                    ui.add_space(8.0);
-                    if ui.button("设置密码").clicked() {
-                        self.set_password();
-                    }
                 });
         }
     }
