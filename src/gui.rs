@@ -20,10 +20,8 @@ pub const WINDOW_TITLE: &str = "WebDesk · 远程桌面";
 #[derive(Clone, Debug, Default)]
 pub struct GuiOptions {
     pub minimized: bool,
-    pub no_start: bool,
     pub port_override: Option<u16>,
     pub config_path: Option<PathBuf>,
-    pub open_browser: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +113,6 @@ struct WebDeskApp {
     log_revision: u64,
     last_log_check: Instant,
     toast: Option<(String, Instant, bool)>,
-    browser_opened: bool,
     repaint_alive: Arc<AtomicBool>,
 }
 
@@ -132,11 +129,7 @@ impl WebDeskApp {
         cfg.autostart = config::autostart_enabled();
 
         let controller = ServerController::new();
-        let tray = Tray::new(
-            cc.egui_ctx.clone(),
-            controller.handle(),
-            opts.config_path.clone(),
-        );
+        let tray = Tray::new(cc.egui_ctx.clone());
         if tray.is_none() {
             log_warn!("系统托盘不可用，关闭窗口将直接退出程序");
         }
@@ -161,11 +154,8 @@ impl WebDeskApp {
             })
             .ok();
 
-        if opts.no_start {
-            log_info!("已按 --no-start 跳过自动启动服务");
-        } else {
-            controller.start(&cfg);
-        }
+        // 服务随程序启动并常驻运行，界面上不提供启动 / 停止
+        controller.start(&cfg);
 
         Self {
             opts,
@@ -186,7 +176,6 @@ impl WebDeskApp {
             log_revision: 0,
             last_log_check: Instant::now(),
             toast: None,
-            browser_opened: false,
             repaint_alive,
         }
     }
@@ -228,20 +217,17 @@ impl WebDeskApp {
         }
 
         let running = matches!(self.status.kind, StateKind::Running | StateKind::Starting);
-        if running {
-            if self.cfg.needs_restart(&self.applied) {
-                self.controller.restart(&self.cfg);
-                self.notify("设置已保存，正在重启服务…", false);
-            } else {
-                // 端口/性能未变：仅热更新密码，连接不中断
-                self.controller.set_password(
-                    self.cfg.password_hash.clone(),
-                    self.cfg.password_plain.clone(),
-                );
-                self.notify("设置已保存并即时生效", false);
-            }
+        if !running || self.cfg.needs_restart(&self.applied) {
+            // 服务常驻：配置变更（或服务当前未运行）一律重启，让其恢复到运行状态
+            self.controller.restart(&self.cfg);
+            self.notify("设置已保存，正在重启服务…", false);
         } else {
-            self.notify("设置已保存，下次启动时生效", false);
+            // 端口/性能未变：仅热更新密码，连接不中断
+            self.controller.set_password(
+                self.cfg.password_hash.clone(),
+                self.cfg.password_plain.clone(),
+            );
+            self.notify("设置已保存并即时生效", false);
         }
         self.applied = self.cfg.clone();
     }
@@ -263,14 +249,6 @@ impl WebDeskApp {
         self.password_confirm.clear();
         self.apply_settings();
         self.notify("访问密码已设置（PBKDF2-SHA256 加盐存储）", false);
-    }
-
-    fn open_browser(&mut self) {
-        let url = format!("http://127.0.0.1:{}/", self.status.port);
-        match config::open_with_system(&url) {
-            Ok(()) => log_info!("已打开浏览器: {url}"),
-            Err(e) => self.notify(format!("打开浏览器失败: {e}"), true),
-        }
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -299,15 +277,6 @@ impl App for WebDeskApp {
             } else {
                 self.confirm_exit = true;
             }
-        }
-
-        // ── 服务启动后按需自动打开浏览器 ───────────────────────────
-        if !self.browser_opened
-            && self.status.kind == StateKind::Running
-            && (self.cfg.open_browser || self.opts.open_browser)
-        {
-            self.browser_opened = true;
-            self.open_browser();
         }
 
         // ── 日志刷新 ────────────────────────────────────────────────
@@ -365,15 +334,6 @@ impl App for WebDeskApp {
             ui.horizontal(|ui| {
                 if ui.button("💾 保存并应用").clicked() {
                     self.apply_settings();
-                }
-                let running = matches!(self.status.kind, StateKind::Running | StateKind::Starting);
-                if ui.add_enabled(!running, egui::Button::new("▶ 启动")).clicked() {
-                    self.controller.start(&self.cfg);
-                    self.notify("正在启动服务…", false);
-                }
-                if ui.add_enabled(running, egui::Button::new("■ 停止")).clicked() {
-                    self.controller.stop();
-                    self.notify("正在停止服务…", false);
                 }
                 if ui.button("🔄 重启").clicked() {
                     self.controller.restart(&self.cfg);
@@ -572,7 +532,6 @@ impl WebDeskApp {
         ui.checkbox(&mut self.cfg.autostart, "开机自动启动（当前用户，无需管理员权限）");
         ui.checkbox(&mut self.cfg.minimize_to_tray, "关闭窗口时最小化到系统托盘（服务继续运行）");
         ui.checkbox(&mut self.cfg.start_minimized, "启动后直接最小化到托盘");
-        ui.checkbox(&mut self.cfg.open_browser, "服务启动后自动打开浏览器");
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui.button("重新检测开机自启").clicked() {

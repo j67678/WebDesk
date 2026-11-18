@@ -1,7 +1,7 @@
 //! WebDesk — Rust 重写的远程桌面服务端 + egui 桌面 GUI。
 //!
 //! 启动方式：
-//!   webdesk                    图形界面（默认自动启动服务）
+//!   webdesk                    图形界面（服务自动启动并常驻运行）
 //!   webdesk --headless          无界面运行（Ctrl+C 退出）
 //!   webdesk --minimized         启动即最小化到托盘
 //!   webdesk --port 9000         临时覆盖端口
@@ -26,6 +26,7 @@ fn attach_console_if_needed() {}
 
 mod capture;
 mod config;
+mod firewall;
 mod globals;
 mod gui;
 mod input;
@@ -42,7 +43,6 @@ use server::ServerController;
 #[derive(Debug, Default)]
 struct Args {
     minimized: bool,
-    no_start: bool,
     headless: bool,
     port: Option<u16>,
     config_path: Option<PathBuf>,
@@ -58,7 +58,6 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--minimized" | "--start-minimized" => a.minimized = true,
-            "--no-start" => a.no_start = true,
             "--no-gui" | "--headless" => a.headless = true,
             "--open-browser" => a.open_browser = true,
             "--verbose" | "-v" => a.verbose = true,
@@ -91,7 +90,6 @@ fn print_help() {
          用法: webdesk [选项]\n\
          \n\
            --minimized          启动后直接最小化到系统托盘\n\
-           --no-start           不自动启动服务\n\
            --headless           无界面模式（等价于 --no-gui），Ctrl+C 退出\n\
            --port <N>           临时覆盖监听端口\n\
            --config <PATH>      指定 config.ini 路径\n\
@@ -145,10 +143,8 @@ fn main() {
 
     let opts = gui::GuiOptions {
         minimized: args.minimized,
-        no_start: args.no_start,
         port_override: args.port,
         config_path: args.config_path.clone(),
-        open_browser: args.open_browser,
     };
     // headless 的临时密码在 GUI 模式下通过配置加载；命令行 --password 时优先应用
     if let Some(pwd) = &args.password {

@@ -61,7 +61,6 @@ pub fn icon_rgba() -> Vec<u8> {
 
 #[cfg(any(windows, target_os = "macos"))]
 mod real {
-    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -70,8 +69,6 @@ mod real {
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
     use super::{icon_rgba, QUIT_REQUESTED};
-    use crate::config::Config;
-    use crate::server::{ServerHandle, StateKind};
     use crate::{log_info, log_warn};
 
     pub struct Tray {
@@ -80,19 +77,14 @@ mod real {
     }
 
     impl Tray {
-        /// `ctx` 用于通过 egui 命令恢复窗口；`server` / `config_path` 让托盘菜单
-        /// 在窗口隐藏（GUI 循环暂停）时也能启停服务。
-        pub fn new(ctx: Context, server: ServerHandle, config_path: Option<PathBuf>) -> Option<Self> {
+        /// `ctx` 用于通过 egui 命令恢复窗口。服务常驻运行，托盘只负责
+        /// 唤出窗口与退出程序。
+        pub fn new(ctx: Context) -> Option<Self> {
             let icon = Icon::from_rgba(icon_rgba(), 32, 32).ok()?;
             let menu = Menu::new();
             let show = MenuItem::new("显示主界面", true, None);
-            let start = MenuItem::new("启动服务", true, None);
-            let stop = MenuItem::new("停止服务", true, None);
             let quit = MenuItem::new("退出 WebDesk", true, None);
             menu.append(&show).ok()?;
-            menu.append(&PredefinedMenuItem::separator()).ok()?;
-            menu.append(&start).ok()?;
-            menu.append(&stop).ok()?;
             menu.append(&PredefinedMenuItem::separator()).ok()?;
             menu.append(&quit).ok()?;
 
@@ -110,8 +102,6 @@ mod real {
             };
 
             let show_id = show.id().clone();
-            let start_id = start.id().clone();
-            let stop_id = stop.id().clone();
             let quit_id = quit.id().clone();
             let thread_ctx = ctx.clone();
             std::thread::Builder::new()
@@ -138,11 +128,6 @@ mod real {
                     while let Ok(ev) = MenuEvent::receiver().try_recv() {
                         if ev.id == show_id {
                             reveal(&thread_ctx);
-                        } else if ev.id == start_id {
-                            start_service(&server, &config_path);
-                        } else if ev.id == stop_id {
-                            log_info!("托盘菜单：停止服务");
-                            server.stop();
                         } else if ev.id == quit_id {
                             log_info!("托盘菜单：退出 WebDesk");
                             QUIT_REQUESTED.store(true, Ordering::SeqCst);
@@ -173,18 +158,6 @@ mod real {
         ctx.send_viewport_cmd(ViewportCommand::Focus);
     }
 
-    fn start_service(server: &ServerHandle, config_path: &Option<PathBuf>) {
-        if matches!(
-            server.status().kind,
-            StateKind::Running | StateKind::Starting
-        ) {
-            log_info!("托盘菜单：服务已在运行");
-            return;
-        }
-        let cfg = Config::load(config_path.as_deref()).clamped();
-        log_info!("托盘菜单：启动服务（端口 {}）", cfg.port);
-        server.start(&cfg);
-    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -195,11 +168,7 @@ pub struct Tray;
 
 #[cfg(not(any(windows, target_os = "macos")))]
 impl Tray {
-    pub fn new(
-        _ctx: eframe::egui::Context,
-        _server: crate::server::ServerHandle,
-        _config_path: Option<std::path::PathBuf>,
-    ) -> Option<Self> {
+    pub fn new(_ctx: eframe::egui::Context) -> Option<Self> {
         None
     }
 }

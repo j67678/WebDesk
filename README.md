@@ -32,12 +32,10 @@ cargo build --release
 | 选项 | 说明 |
 |------|------|
 | `--minimized` | 启动后直接最小化到系统托盘 |
-| `--no-start` | 启动 GUI 但不自动启动服务 |
 | `--headless` | 无界面模式，`Ctrl+C` 退出 |
 | `--port <N>` | 临时覆盖监听端口 |
 | `--config <PATH>` | 指定 `config.ini` 路径 |
 | `--password <PWD>` | 临时指定访问密码（不写入配置文件） |
-| `--open-browser` | 服务启动后打开浏览器 |
 | `--verbose` | 输出调试日志 |
 | `-h, --help` | 显示帮助 |
 
@@ -74,7 +72,6 @@ open_browser = false
 | `autostart` | 开机自动启动（当前用户） | `false` |
 | `minimize_to_tray` | 关闭窗口时最小化到托盘 | `true` |
 | `start_minimized` | 启动后直接最小化到托盘 | `false` |
-| `open_browser` | 服务启动后自动打开浏览器 | `false` |
 
 旧版配置中的 `host`、`ipv4`、`ipv6` 键会被忽略：服务始终双栈监听。
 

@@ -2,7 +2,7 @@
 //!
 //! - 同一端口同时托管 Web 客户端页面与 WebSocket（`/ws`，根路径握手自动重写）
 //! - 访问密码：PBKDF2 校验放 blocking 线程，失败指数退避，未认证不下发任何画面
-//! - 服务可在 GUI 中启动 / 停止 / 重启，密码支持热更新
+//! - 服务随程序启动并常驻运行，配置变更时自动重启；密码支持热更新
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -173,10 +173,6 @@ impl ServerController {
         let _ = self.cmd_tx.send(Command::Start(ServerConfig::from(cfg)));
     }
 
-    pub fn stop(&self) {
-        let _ = self.cmd_tx.send(Command::Stop);
-    }
-
     pub fn restart(&self, cfg: &Config) {
         let _ = self.cmd_tx.send(Command::Stop);
         let _ = self.cmd_tx.send(Command::Start(ServerConfig::from(cfg)));
@@ -194,34 +190,6 @@ impl ServerController {
         }
     }
 
-    /// 取得可跨线程使用的控制句柄（托盘线程等外部入口使用）。
-    pub fn handle(&self) -> ServerHandle {
-        ServerHandle {
-            cmd_tx: self.cmd_tx.clone(),
-            status: self.status.clone(),
-        }
-    }
-}
-
-/// 轻量控制句柄：只持有命令发送端与状态快照，可克隆到任意线程。
-#[derive(Clone)]
-pub struct ServerHandle {
-    cmd_tx: mpsc::UnboundedSender<Command>,
-    status: Arc<Mutex<Status>>,
-}
-
-impl ServerHandle {
-    pub fn status(&self) -> Status {
-        lock_status(&self.status).clone()
-    }
-
-    pub fn start(&self, cfg: &Config) {
-        let _ = self.cmd_tx.send(Command::Start(ServerConfig::from(cfg)));
-    }
-
-    pub fn stop(&self) {
-        let _ = self.cmd_tx.send(Command::Stop);
-    }
 }
 
 impl Drop for ServerController {
@@ -290,6 +258,8 @@ async fn command_loop(mut rx: mpsc::UnboundedReceiver<Command>, status: Arc<Mute
                 );
                 match start_server(&cfg, creds.clone(), status.clone()).await {
                     Ok(r) => {
+                        // 服务已就绪：把程序本身加入防火墙例外，避免局域网客户端被拦截
+                        crate::firewall::ensure_exception();
                         let urls = config::local_addresses(cfg.port);
                         log_info!(
                             "WebDesk 已启动 | 端口 {} | FPS={} | 密码={}",

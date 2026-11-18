@@ -35,7 +35,6 @@ pub struct Config {
     pub autostart: bool,
     pub minimize_to_tray: bool,
     pub start_minimized: bool,
-    pub open_browser: bool,
 }
 
 impl Default for Config {
@@ -50,7 +49,6 @@ impl Default for Config {
             autostart: false,
             minimize_to_tray: true,
             start_minimized: false,
-            open_browser: false,
         }
     }
 }
@@ -107,8 +105,8 @@ impl Config {
                 ("general", "start_minimized") => {
                     c.start_minimized = parse_bool(&val, c.start_minimized)
                 }
-                ("general", "open_browser") => c.open_browser = parse_bool(&val, c.open_browser),
                 // "host" / "ipv4" / "ipv6" 为旧版遗留键：现在固定双栈监听，忽略即可
+                // "open_browser" 为旧版遗留键：服务端不再打开浏览器，忽略即可
                 _ => {}
             }
         }
@@ -145,9 +143,7 @@ impl Config {
              # 关闭窗口时最小化到系统托盘\n\
              minimize_to_tray = {tray}\n\
              # 启动后直接最小化到托盘\n\
-             start_minimized = {startmin}\n\
-             # 服务启动后自动打开浏览器\n\
-             open_browser = {browser}\n",
+             start_minimized = {startmin}\n",
             port = self.port,
             hash = self.password_hash,
             plain = self.password_plain,
@@ -157,7 +153,6 @@ impl Config {
             autostart = b(self.autostart),
             tray = b(self.minimize_to_tray),
             startmin = b(self.start_minimized),
-            browser = b(self.open_browser),
         )
     }
 
@@ -506,7 +501,7 @@ pub fn local_addresses(port: u16) -> Vec<String> {
     urls
 }
 
-/// 打开 URL 或目录（Windows 用 start，Linux 用 xdg-open，macOS 用 open）。
+/// 用系统默认程序打开目录（Windows 用 start，Linux 用 xdg-open，macOS 用 open）。
 pub fn open_with_system(target: &str) -> io::Result<()> {
     #[cfg(windows)]
     {
