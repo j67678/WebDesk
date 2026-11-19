@@ -133,7 +133,8 @@ Web 界面快捷键：`F11` 切换全屏，`Ctrl+V` 粘贴文本到远程桌面�
 - **视频**：Windows DXGI/GDI 捕获 → 纯 Rust H.264 编码（Annex-B / ABR 码控）→ WebRTC RTP/SRTP
 - **连接**：浏览器发 offer，服务端回 answer；双方均只收集 host candidate，实现 IP 直连
 - **信令**：复用原有 `/ws`，新增 `offer` / `answer` / `keyframe` / `adapt` 消息，认证与输入保持不变
-- **弱网**：浏览器侧 `getStats()` 统计丢包率，超阈值请求 IDR 并下调码率；码率触达 `min_bitrate_kbps` 后停止下探（服务端在 `adapt` 入口与编码线程各钳制一次），优先由 WebRTC 抖动缓冲/NACK 与丢帧吸收波动，保证桌面字体始终可读
+- **弱网**：浏览器侧 `getStats()` 统计丢包率，超阈值请求 IDR 并下调码率；码率范围锁定为 `[min_bitrate_kbps, bitrate_kbps]`，服务端在 `adapt` 入口与编码线程各钳制一次，无丢包时也不会一路抬到高码率反复重建编码器，保证桌面字体始终可读
+- **停滞自救**：客户端连续 4 秒无新增解码帧会自动请求 IDR；服务端发布帧时使用自身代次，避免捕获/编码线程启停不同步导致首帧后冻结
 - **多端**：捕获与编码各仅一个线程，所有观看者共享同一份编码帧后再各自写入 RTP 轨
 
 旧版 `tile_size` / `quality` 配置保留以兼容旧 `config.ini`，但已不再参与画面处理。

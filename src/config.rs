@@ -351,6 +351,31 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn min_bitrate_never_below_floor() {
+        let c = Config::from_ini(
+            "[performance]\nbitrate_kbps = 900\nmin_bitrate_kbps = 1800\n",
+        );
+        assert_eq!(c.min_bitrate_kbps, 1800);
+        assert_eq!(
+            c.bitrate_kbps, 1800,
+            "目标码率必须被提升到下限，否则初始码率就会糊字"
+        );
+        assert!(c.to_ini().contains("min_bitrate_kbps = 1800"));
+    }
+
+    #[test]
+    fn min_bitrate_is_clamped_to_supported_range() {
+        let c = Config::from_ini("[performance]\nmin_bitrate_kbps = 50\n");
+        assert_eq!(c.min_bitrate_kbps, 300);
+        assert!(c.bitrate_kbps >= 300);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // 开机自启
 // ──────────────────────────────────────────────────────────────────────────────

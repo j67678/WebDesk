@@ -288,7 +288,7 @@ let pendingMove = null, moveScheduled = false, lastKeyframeRequest = 0;
 let lastRtcStats = { frames: 0, bytes: 0, lost: 0, received: 0 };
 let targetBitrateKbps = 2500, lastAdaptAt = 0;
 // 码率下限由服务端下发；低于该值桌面文字会明显模糊，弱网时宁可掉帧也不继续下探
-let minBitrateKbps = 1500, bitrateAtFloor = false;
+let minBitrateKbps = 1500, maxBitrateKbps = 8000, bitrateAtFloor = false;
 // 心跳对账：本端仍按下的键 / 鼠标键。服务端据此做差集释放。
 const pressedKeys = new Map(), pressedButtons = new Set();
 const keyId = (key, code) => (code || '') + '|' + key;
@@ -384,6 +384,10 @@ function closePeer() {
     video.srcObject.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
     video.srcObject = null;
   }
+  // 重建连接后解码计数从 0 开始，重置基准避免停滞检测误判
+  lastRtcStats = { frames: 0, bytes: 0, lost: 0, received: 0 };
+  lastDecodedFrames = 0; decodedStallAt = 0;
+  lastRcvLost = 0; lastRcvReceived = 0;
 }
 
 function disconnect() {
@@ -443,8 +447,11 @@ function onMessage(evt) {
     requireAuth = false;
     if (Number.isFinite(d.min_bitrate_kbps) && d.min_bitrate_kbps > 0) {
       minBitrateKbps = d.min_bitrate_kbps;
-      if (targetBitrateKbps < minBitrateKbps) targetBitrateKbps = minBitrateKbps;
     }
+    if (Number.isFinite(d.max_bitrate_kbps) && d.max_bitrate_kbps > 0) {
+      maxBitrateKbps = Math.max(d.max_bitrate_kbps, minBitrateKbps);
+    }
+    targetBitrateKbps = Math.min(maxBitrateKbps, Math.max(minBitrateKbps, targetBitrateKbps));
     startWebRtc();
     return;
   }
@@ -544,6 +551,19 @@ async function collectRtcStats() {
         lastRtcStats = { frames, bytes, lost, received };
 
         const now = performance.now();
+
+        // 解码停滞自救：偶发的解码器状态卡死会表现为有收包但无新帧，
+        // 连续 4 秒无新增解码帧则请求 IDR，避免画面永久冻结。
+        if (frames > lastDecodedFrames) {
+          lastDecodedFrames = frames;
+          decodedStallAt = 0;
+        } else if (decodedStallAt === 0) {
+          decodedStallAt = now;
+        } else if (now - decodedStallAt >= 4000) {
+          requestKeyframe();
+          decodedStallAt = now - 3000; // 之后每秒重试一次
+        }
+
         if (now - lastAdaptAt >= 3000 && received > lastRcvReceived + 30) {
           const lostDelta = Math.max(0, lost - lastRcvLost);
           const rcvDelta = Math.max(0, received - lastRcvReceived);
@@ -554,7 +574,7 @@ async function collectRtcStats() {
             next = Math.max(minBitrateKbps, Math.round(targetBitrateKbps * 0.75));
             requestKeyframe();
           } else if (lossRate < 0.01) {
-            next = Math.min(8000, Math.round(targetBitrateKbps * 1.15));
+            next = Math.min(maxBitrateKbps, Math.round(targetBitrateKbps * 1.15));
           }
           bitrateAtFloor = next <= minBitrateKbps && lossRate > 0.05;
           if (next !== targetBitrateKbps) {
@@ -569,6 +589,7 @@ async function collectRtcStats() {
   } catch (e) {}
 }
 let lastRcvLost = 0, lastRcvReceived = 0;
+let lastDecodedFrames = 0, decodedStallAt = 0;
 
 // ── 缩放 / 坐标 ────────────────────────────────────────────────────
 function applyZoom(z) {

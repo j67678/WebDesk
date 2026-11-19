@@ -226,6 +226,7 @@ struct AppState {
     viewers: Arc<AtomicUsize>,
     encoded_hub: Arc<EncodedHub>,
     encoder_control: Arc<Mutex<EncoderControl>>,
+    bitrate_kbps: u32,
     min_bitrate_kbps: u32,
     frame_interval: Duration,
     shutdown: watch::Sender<bool>,
@@ -434,12 +435,16 @@ impl EncodedHub {
         }
     }
 
-    fn publish(&self, frame: EncodedFrame) {
+    fn publish(&self, mut frame: EncodedFrame) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.closed {
             return;
         }
         st.generation += 1;
+        // 必须覆盖为 hub 自身代次：生产者传入的 generation 来自 FrameHub，
+        // 编码线程在空帧/失败分支会跳过 publish，两者一旦错位，消费者按
+        // frame.generation 更新 last_gen 后 wait_newer 会永久超时 -> 画面冻结。
+        frame.generation = st.generation;
         st.latest = Some(frame);
         drop(st);
         self.cv.notify_all();
@@ -602,7 +607,7 @@ fn spawn_encoder_thread(
                 };
                 if let Some(requested) = new_bitrate {
                     // 服务端权威下限：即使客户端上报异常低值也绝不突破清晰度底线
-                    let kbps = requested.max(min_bitrate_kbps);
+                    let kbps = requested.clamp(min_bitrate_kbps, bitrate_kbps);
                     if kbps != requested {
                         log_warn!(
                             "客户端建议码率 {requested} kbps 低于下限，已钳制为 {kbps} kbps"
@@ -763,6 +768,7 @@ async fn start_server(
         viewers: viewers.clone(),
         encoded_hub: encoded_hub.clone(),
         encoder_control: encoder_control.clone(),
+        bitrate_kbps: cfg.bitrate_kbps,
         min_bitrate_kbps: cfg.min_bitrate_kbps,
         frame_interval,
         shutdown: shutdown.clone(),
@@ -925,8 +931,10 @@ fn init_payload(state: &AppState, require_auth: bool) -> String {
         "height": if require_auth { 0 } else { state.screen_height },
         "codec": "h264",
         "transport": "webrtc-host",
-        // 下发给客户端，保证两端自适应使用同一下限
+        // 下发给客户端，保证两端自适应使用同一上下限；上限即配置的目标码率，
+        // 避免无丢包时一路抬到 8000 反复重建编码器。
         "min_bitrate_kbps": state.min_bitrate_kbps,
+        "max_bitrate_kbps": state.bitrate_kbps,
         "require_auth": require_auth,
     })
     .to_string()
@@ -1155,22 +1163,38 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 let stop_pull = media_stop.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut last_gen = 0u64;
+                                    let mut pulled = 0u64;
+                                    let mut last_log = std::time::Instant::now();
                                     while !stop_pull.load(Ordering::Relaxed) {
                                         if let Some(frame) = hub.wait_newer(last_gen, Duration::from_millis(100)) {
                                             last_gen = frame.generation;
+                                            pulled += 1;
                                             if frame_tx.blocking_send(frame).is_err() {
                                                 break;
                                             }
+                                        }
+                                        if last_log.elapsed() >= Duration::from_secs(5) {
+                                            log_debug!("WebRTC 取帧 {pulled} 帧/5s, last_gen={last_gen}");
+                                            pulled = 0;
+                                            last_log = std::time::Instant::now();
                                         }
                                     }
                                 });
                                 let interval = state.frame_interval;
                                 media_task = Some(tokio::spawn(async move {
+                                    let mut written = 0u64;
+                                    let mut last_log = std::time::Instant::now();
                                     while let Some(frame) = frame_rx.recv().await {
                                         let data = (*frame.data).clone();
                                         if let Err(e) = track_writer.write_h264(data, interval).await {
                                             log_warn!("WebRTC 写帧失败: {e}");
                                             break;
+                                        }
+                                        written += 1;
+                                        if last_log.elapsed() >= Duration::from_secs(5) {
+                                            log_debug!("WebRTC 写帧 {written} 帧/5s");
+                                            written = 0;
+                                            last_log = std::time::Instant::now();
                                         }
                                     }
                                 }));
@@ -1198,7 +1222,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // 弱网反馈：客户端根据 getStats() 丢包率建议目标码率。
                         // 入口即钳制下限，避免字体因码率过低而模糊（编码线程还有一道兜底）。
                         if require_auth_ok!() && msg.bitrate_kbps > 0 {
-                            let kbps = msg.bitrate_kbps.max(state.min_bitrate_kbps);
+                            let kbps = msg
+                                .bitrate_kbps
+                                .clamp(state.min_bitrate_kbps, state.bitrate_kbps);
                             if kbps != msg.bitrate_kbps {
                                 log_debug!(
                                     "adapt 码率 {} kbps 低于下限，钳制为 {} kbps",
@@ -1254,4 +1280,35 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
 async fn creds_required(state: &AppState) -> bool {
     state.creds.read().await.required()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 生产者代次跳跃时，消费者用上一帧的 generation 必须仍能取到后续帧。
+    /// 曾因发布时未覆盖 generation（沿用 FrameHub 代次）导致画面首帧后冻结。
+    #[test]
+    fn encoded_hub_generation_is_self_consistent() {
+        let hub = EncodedHub::new();
+        hub.publish(EncodedFrame {
+            generation: 100,
+            data: Arc::new(vec![1]),
+            keyframe: true,
+        });
+        let first = hub
+            .wait_newer(0, Duration::from_millis(10))
+            .expect("首帧应可取");
+        assert_eq!(first.generation, 1, "必须使用 hub 自身代次");
+
+        hub.publish(EncodedFrame {
+            generation: 5000,
+            data: Arc::new(vec![2]),
+            keyframe: false,
+        });
+        let second = hub
+            .wait_newer(first.generation, Duration::from_millis(10))
+            .expect("代次跳跃后仍能取到新帧，否则画面冻结");
+        assert_eq!(second.generation, 2);
+    }
 }
