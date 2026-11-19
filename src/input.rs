@@ -103,7 +103,7 @@ impl InputState {
             self.keys_down.insert(vk, now);
         }
 
-        // 鼠标键同理
+        // 鼠标键同理：只释放客户端已确认松开的按键
         let desired_buttons: HashSet<i32> = msg.buttons.iter().copied().collect();
         let stale_buttons: Vec<i32> = self
             .buttons_down
@@ -201,15 +201,20 @@ fn handle_mouse(msg: &ClientMessage, state: &mut InputState) {
     match msg.kind.as_str() {
         "mousemove" => imp::mouse_move(x, y),
         "mousedown" => {
+            // 按键前先对齐坐标：即使之前的 mousemove 丢失/被合并，
+            // 也不会把点击落在旧位置（旧 Python 版同样在按下前定位光标）。
+            imp::mouse_move(x, y);
             imp::mouse_button(msg.button, true);
             state.buttons_down.insert(msg.button);
         }
         "mouseup" => {
+            imp::mouse_move(x, y);
             // 无条件抬起，避免漏抬导致远程鼠标左键一直按着
             imp::mouse_button(msg.button, false);
             state.buttons_down.remove(&msg.button);
         }
         "dblclick" => {
+            imp::mouse_move(x, y);
             imp::mouse_button(msg.button, true);
             imp::mouse_button(msg.button, false);
             imp::mouse_button(msg.button, true);
@@ -393,12 +398,23 @@ mod imp {
         if inputs.is_empty() {
             return;
         }
-        unsafe {
+        let sent = unsafe {
             SendInput(
                 inputs.len() as u32,
                 inputs.as_ptr(),
                 size_of::<INPUT>() as i32,
-            );
+            )
+        };
+        // 被 UIPI 拦截（目标窗口以管理员权限运行）或被安全软件禁止时，
+        // SendInput 会静默返回 0；只提示一次，避免刷屏。
+        if sent == 0 {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log_warn!(
+                    "SendInput 注入失败: {}（若目标程序以管理员权限运行，请以管理员身份运行 WebDesk）",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
     }
 
@@ -435,8 +451,12 @@ mod imp {
 
     pub fn mouse_move(x: i32, y: i32) {
         let (ox, oy) = capture::virtual_screen_origin();
-        unsafe {
-            SetCursorPos(x.saturating_add(ox), y.saturating_add(oy));
+        let ok = unsafe { SetCursorPos(x.saturating_add(ox), y.saturating_add(oy)) };
+        if ok == 0 {
+            crate::log_debug!(
+                "SetCursorPos 失败: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 

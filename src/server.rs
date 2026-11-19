@@ -34,8 +34,6 @@ use crate::log_info;
 use crate::log_warn;
 use crate::protocol::{auth_backoff_ms, ClientMessage, MAX_AUTH_FAILURES};
 
-const BOOT_MARKER: &str = "/*__WEBDESK_BOOT__*/";
-
 /// 同时在线的 WebSocket 客户端上限。每个连接都独占一份全屏缓冲与截屏线程，
 /// 不设上限时异常/恶意重连会把内存与线程耗尽。
 const MAX_CLIENTS: usize = 6;
@@ -549,7 +547,7 @@ async fn start_server(
     let clients = Arc::new(AtomicUsize::new(0));
     let viewers = Arc::new(AtomicUsize::new(0));
     let hub = Arc::new(FrameHub::new());
-    let html = Arc::new(render_client_html(cfg.port));
+    let html = Arc::new(render_client_html());
     let (screen_width, screen_height) = virtual_screen_size();
     if screen_width == 0 || screen_height == 0 {
         return Err("无法获取屏幕分辨率".into());
@@ -641,22 +639,11 @@ fn bind_v6(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::from_std(std_listener)
 }
 
-/// 把服务端启动参数注入页面；若程序目录存在自定义 client.html 则优先使用。
-fn render_client_html(port: u16) -> String {
+/// 若程序目录存在自定义 client.html 则优先使用，否则回退到内嵌页面。
+fn render_client_html() -> String {
     let external = config::app_dir().join("client.html");
-    let template = std::fs::read_to_string(external)
-        .unwrap_or_else(|_| include_str!("../assets/client.html").to_string());
-    let boot = json!({
-        "port": port,
-        "autoConnect": true,
-        "serverInjected": true,
-    })
-    .to_string();
-    if template.contains(BOOT_MARKER) {
-        template.replace(BOOT_MARKER, &format!("window.WEBDESK_BOOT = {boot};"))
-    } else {
-        template.replace("value=\"8765\"", &format!("value=\"{port}\""))
-    }
+    std::fs::read_to_string(external)
+        .unwrap_or_else(|_| include_str!("../assets/client.html").to_string())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

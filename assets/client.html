@@ -58,15 +58,6 @@
     letter-spacing: -.5px; white-space: nowrap;
   }
   #toolbar .logo span { color: #a78bfa; }
-  .toolbar-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  #toolbar input[type="text"], #toolbar input[type="number"] {
-    background: #0d1117; border: 1px solid var(--border); color: var(--text);
-    border-radius: 8px; padding: 7px 10px; font-size: 14px; outline: none;
-    -webkit-user-select: text; user-select: text;
-  }
-  #toolbar input[type="text"]:focus, #toolbar input[type="number"]:focus { border-color: var(--accent); }
-  #toolbar input[type="text"] { width: 168px; min-width: 0; flex: 1 1 110px; }
-  #toolbar input[type="number"] { width: 76px; }
 
   .btn {
     min-height: 34px; padding: 6px 14px; border-radius: 8px; border: none;
@@ -191,9 +182,6 @@
     #toolbar { gap: 7px; padding: 6px 8px; }
     #toolbar .logo, #stats, label { display: none; }
     .btn { min-height: var(--tap); padding: 0 14px; font-size: 14px; }
-    #toolbar input[type="text"] { flex: 1 1 90px; width: auto; }
-    #toolbar input[type="number"] { width: 72px; min-height: var(--tap); }
-    .toolbar-group { flex: 1 1 100%; }
     #status-text { font-size: 12px; }
     #touchbar { display: block; }
     #remote-cursor { display: none; }
@@ -214,11 +202,6 @@
 
 <div id="toolbar">
   <div class="logo">🖥️ Web<span>Desk</span></div>
-
-  <div class="toolbar-group">
-    <input type="text" id="host" placeholder="主机地址" autocomplete="off" spellcheck="false">
-    <input type="number" id="port" value="8765" min="1" max="65535" inputmode="numeric">
-  </div>
 
   <button class="btn btn-primary" id="btn-connect">连接</button>
   <button class="btn btn-danger" id="btn-disconnect" disabled>断开</button>
@@ -246,7 +229,7 @@
   <div id="overlay">
     <div class="icon">🖥️</div>
     <div class="title">远程桌面</div>
-    <div class="subtitle">输入服务端地址后点击「连接」。<br>触屏：单指轻点＝单击，拖动＝移动光标，长按＝右键，双指＝缩放 / 滚动。</div>
+    <div class="subtitle">正在自动连接当前服务端…<br>触屏：单指轻点＝单击，拖动＝移动光标，长按＝右键，双指＝缩放 / 滚动。</div>
   </div>
 </div>
 
@@ -292,9 +275,6 @@
 <script>
 'use strict';
 
-/*__WEBDESK_BOOT__*/
-const BOOT = window.WEBDESK_BOOT || { port: 8765, autoConnect: false, serverInjected: false };
-
 // ── 状态 ───────────────────────────────────────────────────────────
 let ws = null;
 let remoteWidth = 1920, remoteHeight = 1080;
@@ -305,6 +285,15 @@ let frameCount = 0, tileCount = 0, byteCount = 0;
 let remoteTileSize = 64, decodeChain = Promise.resolve();
 let decodePending = 0, pendingDraw = new Map(), drawScheduled = false;
 let pendingMove = null, moveScheduled = false, lastFullRequest = 0;
+// 心跳对账：本端仍按下的键 / 鼠标键。服务端据此做差集释放，
+// 若上报集合为空（旧实现），服务端每秒会把仍按住的键和鼠标键强制抬起。
+const pressedKeys = new Map(), pressedButtons = new Set();
+const keyId = (key, code) => (code || '') + '|' + key;
+function releaseAllLocal() {
+  pressedKeys.clear();
+  pressedButtons.clear();
+  send({ type: 'release_all' });
+}
 
 // 全量刷新请求去抖，避免解码失败时刷屏
 function requestFullOnce() {
@@ -346,21 +335,9 @@ function vibrate(ms) { if (navigator.vibrate) try { navigator.vibrate(ms); } cat
 
 // ── 连接管理 ───────────────────────────────────────────────────────
 function wsUrl() {
-  const hostInput = $('host').value.trim();
-  const port = $('port').value.trim() || String(BOOT.port || 8765);
-  let host = hostInput;
-  let usePort = port;
-  if (!host && BOOT.serverInjected) {
-    // 服务端注入时直接使用页面自身的 host（IPv6 已带方括号），避免地址猜测错误
-    host = location.host;
-    usePort = '';
-  }
-  if (!host) host = location.hostname || 'localhost';
-  if (host.startsWith('[')) {
-    const end = host.indexOf(']');
-    return `ws://${host.slice(0, end + 1)}${host.slice(end + 1).includes(':') ? '' : ':' + usePort}/ws`;
-  }
-  return `ws://${host}${usePort ? ':' + usePort : ''}/ws`;
+  // 页面由服务端提供，直接连接当前页面的主机与端口（IPv6 已带方括号）
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/ws`;
 }
 
 function connect() {
@@ -572,8 +549,10 @@ wrapper.addEventListener('pointerdown', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
   e.preventDefault();
   flushMove();
+  updateCursor(e.clientX, e.clientY);
   const p = toRemote(e.clientX, e.clientY);
   send({ type: 'mousedown', x: p.x, y: p.y, button: e.button });
+  pressedButtons.add(e.button);
   wrapper.setPointerCapture(e.pointerId);
 });
 wrapper.addEventListener('pointermove', e => {
@@ -596,6 +575,7 @@ wrapper.addEventListener('pointerup', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
   e.preventDefault();
   flushMove();
+  pressedButtons.delete(e.button);
   const p = toRemote(e.clientX, e.clientY);
   send({ type: 'mouseup', x: p.x, y: p.y, button: e.button });
 });
@@ -631,6 +611,7 @@ wrapper.addEventListener('touchstart', e => {
     send({ type: 'mousemove', x: p.x, y: p.y });
     if (touchMode === 'drag') {
       send({ type: 'mousedown', x: p.x, y: p.y, button: 0 }); T.dragDown = true;
+      pressedButtons.add(0);
     } else {
       clearLongPress();
       T.longTimer = setTimeout(() => {
@@ -645,7 +626,7 @@ wrapper.addEventListener('touchstart', e => {
     }
   } else if (e.touches.length >= 2) {
     clearLongPress();
-    if (T.dragDown) { const p = toRemote(T.lastX, T.lastY); send({ type: 'mouseup', x: p.x, y: p.y, button: 0 }); T.dragDown = false; }
+    if (T.dragDown) { const p = toRemote(T.lastX, T.lastY); send({ type: 'mouseup', x: p.x, y: p.y, button: 0 }); T.dragDown = false; pressedButtons.delete(0); }
     T.active = true; T.mode = 'pinch'; T.longFired = true;
     T.startDist = dist(e.touches[0], e.touches[1]) || 1;
     T.startZoom = zoom;
@@ -696,6 +677,7 @@ function endTouch(e) {
     const p = toRemote(T.lastX, T.lastY);
     if (T.dragDown) {
       send({ type: 'mouseup', x: p.x, y: p.y, button: 0 });
+      pressedButtons.delete(0);
     } else if (!T.moved) {
       const now = performance.now();
       const isDouble = now - T.lastTap < 320 && Math.hypot(p.x - T.lastTapX, p.y - T.lastTapY) < 40;
@@ -732,8 +714,10 @@ document.addEventListener('keydown', e => {
   if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); return; }
   if (e.key !== 'F5') e.preventDefault();
   send({ type: 'keydown', key: e.key, code: e.code, modifiers: activeModifiers(e) });
+  pressedKeys.set(keyId(e.key, e.code), { key: e.key, code: e.code });
 }, { passive: false });
 document.addEventListener('keyup', e => {
+  pressedKeys.delete(keyId(e.key, e.code));
   if (!isConnected || authDialog.classList.contains('show')) return;
   if (e.target instanceof HTMLInputElement) return;
   if (e.key === 'F11') return;
@@ -819,6 +803,9 @@ document.addEventListener('fullscreenchange', () => {
   if (!manualZoom) fitToWindow();
   else applyZoom(zoom);
 });
+// 失焦 / 切后台时释放本端记录的全部按键，避免服务端残留按下状态
+window.addEventListener('blur', releaseAllLocal);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAllLocal(); });
 
 // ── 统计 ───────────────────────────────────────────────────────────
 function activateConnection() {
@@ -838,7 +825,13 @@ function startTimers() {
   stopTimers(); lastStatTime = performance.now();
   pingTimer = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN && pingStart === 0) {
-      pingStart = performance.now(); send({ type: 'ping' });
+      pingStart = performance.now();
+      // 附带当前真实按下的键与鼠标键，服务端据此释放残留按键
+      send({
+        type: 'ping',
+        keys: [...pressedKeys.values()],
+        buttons: [...pressedButtons]
+      });
     }
   }, 1000);
   statTimer = setInterval(() => {
@@ -860,16 +853,6 @@ $('btn-fullscreen').addEventListener('click', toggleFullscreen);
 $('auth-submit').addEventListener('click', submitAuth);
 $('auth-cancel').addEventListener('click', () => { authDialog.classList.remove('show'); disconnect(); });
 authPassword.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitAuth(); } });
-$('host').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
-$('port').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
-
-$('host').placeholder = location.hostname || 'localhost';
-$('port').value = BOOT.port || 8765;
-if (!BOOT.serverInjected) {
-  const savedHost = store.get('rdp_host', '');
-  if (savedHost) $('host').value = savedHost;
-}
-$('host').addEventListener('change', e => store.set('rdp_host', e.target.value.trim()));
 
 window.addEventListener('resize', () => { if (!manualZoom) fitToWindow(); });
 window.addEventListener('orientationchange', () => setTimeout(() => { if (!manualZoom) fitToWindow(); }, 250));
@@ -878,7 +861,7 @@ canvas.width = 1920; canvas.height = 1080;
 ctx.fillStyle = '#111'; ctx.fillRect(0, 0, 1920, 1080);
 fitToWindow();
 
-if (BOOT.autoConnect) setTimeout(connect, 60);
+setTimeout(connect, 60);
 </script>
 </body>
 </html>
