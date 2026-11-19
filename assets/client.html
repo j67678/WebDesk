@@ -441,13 +441,25 @@ function onMessage(evt) {
 }
 
 // ── 二进制画面帧 ───────────────────────────────────────────────────
-// 格式：u8 类型=1 | u16 矩形数 | 每块 [x,y,w,h u16][len u32][jpeg 字节]
+// 格式：u8 类型=1 | u16 矩形数 | u16 宽 | u16 高 | 每块 [x,y,w,h u16][len u32][jpeg 字节]
 function onFrameBinary(buf) {
   const view = new DataView(buf);
-  if (buf.byteLength < 3 || view.getUint8(0) !== 1) return;
+  if (buf.byteLength < 7 || view.getUint8(0) !== 1) return;
   const count = view.getUint16(1, true);
+  const fw = view.getUint16(3, true), fh = view.getUint16(5, true);
+  // 分辨率变化时同步画布尺寸并请求一次全量刷新
+  if (fw && fh && (fw !== remoteWidth || fh !== remoteHeight)) {
+    remoteWidth = fw;
+    remoteHeight = fh;
+    canvas.width = fw;
+    canvas.height = fh;
+    ctx.fillStyle = '#111';
+    ctx.fillRect(0, 0, fw, fh);
+    fitToWindow();
+    send({ type: 'request_full' });
+  }
   const rects = [];
-  let off = 3, bytes = 0;
+  let off = 7, bytes = 0;
   for (let i = 0; i < count; i++) {
     if (off + 12 > buf.byteLength) return;
     const x = view.getUint16(off, true), y = view.getUint16(off + 2, true);

@@ -25,7 +25,7 @@ pub struct DirtyRect {
     pub h: u32,
 }
 
-pub use imp::{virtual_screen_origin, ScreenCapturer};
+pub use imp::{virtual_screen_origin, virtual_screen_size, ScreenCapturer};
 
 /// 捕获线程产出的共享帧：像素 + 全局瓦片哈希。
 ///
@@ -248,6 +248,25 @@ mod imp {
     use std::io;
     use std::mem::{size_of, zeroed};
     use std::ptr::null_mut;
+
+    use windows::core::{Error as WinError, Interface};
+    use windows::Win32::Foundation::{HMODULE, RECT};
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_11_0,
+    };
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+        D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_SAMPLE_DESC,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+        DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    };
     use windows_sys::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
         SelectObject, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC,
@@ -277,8 +296,397 @@ mod imp {
         }
     }
 
-    /// 复用同一块 DIB Section：BitBlt 直接写入像素内存，无需每帧 GetDIBits 转换。
+    fn win_err(e: WinError) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, e.to_string())
+    }
+
+    /// 捕获后端选择：优先 DXGI Desktop Duplication，条件不满足时回退 GDI BitBlt。
     pub struct ScreenCapturer {
+        backend: Backend,
+        width: u32,
+        height: u32,
+    }
+
+    enum Backend {
+        Dxgi(DxgiCapturer),
+        Gdi(GdiCapturer),
+    }
+
+    impl ScreenCapturer {
+        pub fn new() -> io::Result<Self> {
+            let (width, height) = virtual_screen_size();
+            let backend = match DxgiCapturer::new() {
+                Ok(d) => {
+                    crate::log_info!("屏幕捕获后端: DXGI Desktop Duplication（不含远程光标）");
+                    Backend::Dxgi(d)
+                }
+                Err(e) => {
+                    crate::log_warn!("DXGI 不可用，回退 GDI BitBlt: {e}");
+                    Backend::Gdi(GdiCapturer::new()?)
+                }
+            };
+            Ok(Self {
+                backend,
+                width,
+                height,
+            })
+        }
+
+        pub fn size(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+
+        /// 返回 `None` 表示本次没有任何显示器更新（DXGI 空闲），调用方可跳过哈希与下发。
+        pub fn capture(&mut self) -> io::Result<Option<Frame<'_>>> {
+            let (w, h) = virtual_screen_size();
+            if (w, h) != (self.width, self.height) {
+                crate::log_debug!(
+                    "桌面尺寸变化 {}x{} -> {}x{}，重建捕获后端",
+                    self.width,
+                    self.height,
+                    w,
+                    h
+                );
+                self.width = w;
+                self.height = h;
+                self.rebuild()?;
+                return Ok(None);
+            }
+
+            let mut updated = false;
+            let mut need_rebuild = false;
+            match &mut self.backend {
+                Backend::Dxgi(dxgi) => match dxgi.capture() {
+                    Ok(v) => updated = v,
+                    Err(e) => {
+                        crate::log_warn!("DXGI 捕获异常，重建捕获后端: {e}");
+                        need_rebuild = true;
+                    }
+                },
+                Backend::Gdi(gdi) => {
+                    gdi.capture()?;
+                    updated = true;
+                }
+            }
+            if need_rebuild {
+                self.rebuild()?;
+                return Ok(None);
+            }
+            if !updated {
+                return Ok(None);
+            }
+
+            let data = match &self.backend {
+                Backend::Dxgi(d) => &d.buffer[..],
+                Backend::Gdi(g) => g.data(),
+            };
+            Ok(Some(Frame {
+                width: self.width,
+                height: self.height,
+                data,
+            }))
+        }
+
+        fn rebuild(&mut self) -> io::Result<()> {
+            // 先构造 GDI 兜底并释放旧 backend：同一输出在旧 duplication 存活时
+            // 无法再次 DuplicateOutput，必须先 Drop。
+            let fallback = GdiCapturer::new()?;
+            let old = std::mem::replace(&mut self.backend, Backend::Gdi(fallback));
+            drop(old);
+
+            match DxgiCapturer::new() {
+                Ok(d) => self.backend = Backend::Dxgi(d),
+                Err(e) => crate::log_warn!("DXGI 重建失败，继续使用 GDI: {e}"),
+            }
+            Ok(())
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // DXGI Desktop Duplication
+    // ──────────────────────────────────────────────────────────────────────────
+
+    struct OutputDup {
+        /// 在虚拟桌面缓冲中的偏移
+        dx: u32,
+        dy: u32,
+        width: u32,
+        height: u32,
+        duplication: IDXGIOutputDuplication,
+        staging: Option<ID3D11Texture2D>,
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+    }
+
+    impl OutputDup {
+        /// 把当前帧拷贝进虚拟桌面缓冲；返回本次是否有新内容。
+        fn copy_frame(&mut self, buffer: &mut [u8], screen_width: u32) -> io::Result<bool> {
+            let mut info: DXGI_OUTDUPL_FRAME_INFO = unsafe { zeroed() };
+            let mut resource: Option<IDXGIResource> = None;
+            match unsafe { self.duplication.AcquireNextFrame(0, &mut info, &mut resource) } {
+                Ok(()) => {}
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+                Err(e) => return Err(win_err(e)),
+            }
+
+            let result = (|| -> io::Result<bool> {
+                let Some(resource) = resource else {
+                    return Ok(false);
+                };
+                let texture: ID3D11Texture2D = resource.cast().map_err(win_err)?;
+
+                if self.staging.is_none() {
+                    let desc = D3D11_TEXTURE2D_DESC {
+                        Width: self.width,
+                        Height: self.height,
+                        MipLevels: 1,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Usage: D3D11_USAGE_STAGING,
+                        BindFlags: 0,
+                        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                        MiscFlags: 0,
+                    };
+                    let mut staging: Option<ID3D11Texture2D> = None;
+                    unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut staging)) }
+                        .map_err(win_err)?;
+                    self.staging = staging;
+                }
+                let staging = self
+                    .staging
+                    .as_ref()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "创建暂存纹理失败"))?;
+
+                let dst: ID3D11Resource = staging.cast().map_err(win_err)?;
+                let src: ID3D11Resource = texture.cast().map_err(win_err)?;
+                unsafe { self.context.CopyResource(&dst, &src) };
+
+                let mut mapped: D3D11_MAPPED_SUBRESOURCE = unsafe { zeroed() };
+                unsafe {
+                    self.context
+                        .Map(&dst, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                }
+                .map_err(win_err)?;
+                copy_rows(
+                    buffer,
+                    screen_width,
+                    self.dx,
+                    self.dy,
+                    self.width,
+                    self.height,
+                    mapped.pData as *const u8,
+                    mapped.RowPitch as usize,
+                );
+                unsafe { self.context.Unmap(&dst, 0) };
+                Ok(true)
+            })();
+
+            // 无论拷贝是否成功都必须配对释放帧
+            let _ = unsafe { self.duplication.ReleaseFrame() };
+            result
+        }
+    }
+
+    struct DxgiCapturer {
+        outputs: Vec<OutputDup>,
+        buffer: Vec<u8>,
+        width: u32,
+    }
+
+    impl DxgiCapturer {
+        fn new() -> io::Result<Self> {
+            let (origin_x, origin_y) = virtual_screen_origin();
+            let (width, height) = virtual_screen_size();
+            if width == 0 || height == 0 {
+                return Err(io::Error::new(io::ErrorKind::Other, "无效的桌面尺寸"));
+            }
+
+            let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(win_err)?;
+
+            // 先统计桌面上所有已连接输出，用于确认 DXGI 覆盖完整
+            let mut attached = 0u32;
+            let mut adapter_index = 0u32;
+            loop {
+                let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+                    Ok(a) => a,
+                    Err(_) => break,
+                };
+                adapter_index += 1;
+                let mut output_index = 0u32;
+                loop {
+                    let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                        Ok(o) => o,
+                        Err(_) => break,
+                    };
+                    output_index += 1;
+                    let desc = unsafe { output.GetDesc() }.map_err(win_err)?;
+                    if desc.AttachedToDesktop.as_bool() {
+                        attached += 1;
+                    }
+                }
+            }
+            if attached == 0 {
+                return Err(io::Error::new(io::ErrorKind::Other, "没有可捕获的显示器"));
+            }
+
+            let mut outputs = Vec::new();
+            let mut adapter_index = 0u32;
+            loop {
+                let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+                    Ok(a) => a,
+                    Err(_) => break,
+                };
+                adapter_index += 1;
+
+                // DuplicateOutput 要求设备与输出属于同一适配器
+                let mut device: Option<ID3D11Device> = None;
+                let mut context: Option<ID3D11DeviceContext> = None;
+                let mut level = D3D_FEATURE_LEVEL_11_0;
+                let created = unsafe {
+                    D3D11CreateDevice(
+                        &adapter,
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        HMODULE(null_mut()),
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                        Some(&[
+                            D3D_FEATURE_LEVEL_11_0,
+                            D3D_FEATURE_LEVEL_10_1,
+                            D3D_FEATURE_LEVEL_10_0,
+                        ]),
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        Some(&mut level),
+                        Some(&mut context),
+                    )
+                };
+                if created.is_err() {
+                    continue;
+                }
+                let (Some(device), Some(context)) = (device, context) else {
+                    continue;
+                };
+
+                let mut output_index = 0u32;
+                loop {
+                    let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                        Ok(o) => o,
+                        Err(_) => break,
+                    };
+                    output_index += 1;
+
+                    let desc = unsafe { output.GetDesc() }.map_err(win_err)?;
+                    if !desc.AttachedToDesktop.as_bool() {
+                        continue;
+                    }
+                    if desc.Rotation != DXGI_MODE_ROTATION_IDENTITY {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "显示器存在旋转，DXGI 暂不支持",
+                        ));
+                    }
+
+                    let output1: IDXGIOutput1 = output.cast().map_err(win_err)?;
+                    let duplication = unsafe { output1.DuplicateOutput(&device) }.map_err(win_err)?;
+                    let dup_desc = unsafe { duplication.GetDesc() };
+                    if dup_desc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "显示器像素格式不是 BGRA8（可能为 HDR）",
+                        ));
+                    }
+
+                    let rect: RECT = desc.DesktopCoordinates;
+                    let left = rect.left.max(origin_x);
+                    let top = rect.top.max(origin_y);
+                    let right = rect.right.min(origin_x + width as i32);
+                    let bottom = rect.bottom.min(origin_y + height as i32);
+                    if right <= left || bottom <= top {
+                        continue;
+                    }
+
+                    outputs.push(OutputDup {
+                        dx: (left - origin_x) as u32,
+                        dy: (top - origin_y) as u32,
+                        width: (right - left) as u32,
+                        height: (bottom - top) as u32,
+                        duplication,
+                        staging: None,
+                        device: device.clone(),
+                        context: context.clone(),
+                    });
+                }
+            }
+
+            if outputs.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::Other, "没有可用的 DXGI 输出"));
+            }
+            if outputs.len() as u32 != attached {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "显示器分布在多个显卡上，DXGI 覆盖不完整",
+                ));
+            }
+
+            let mut capturer = Self {
+                outputs,
+                buffer: vec![0u8; width as usize * height as usize * 4],
+                width,
+            };
+            // 先用 GDI 抓一帧作为初始内容，避免首个脏帧到来前黑屏
+            if let Ok(mut gdi) = GdiCapturer::new() {
+                if gdi.capture().is_ok() {
+                    let data = gdi.data();
+                    if data.len() == capturer.buffer.len() {
+                        capturer.buffer.copy_from_slice(data);
+                    }
+                }
+            }
+            Ok(capturer)
+        }
+
+        fn capture(&mut self) -> io::Result<bool> {
+            let DxgiCapturer {
+                outputs,
+                buffer,
+                width,
+            } = self;
+            let mut updated = false;
+            for out in outputs.iter_mut() {
+                if out.copy_frame(buffer, *width)? {
+                    updated = true;
+                }
+            }
+            Ok(updated)
+        }
+    }
+
+    /// 把一行行 BGRA 数据拷贝到虚拟桌面缓冲的指定偏移。
+    fn copy_rows(
+        buffer: &mut [u8],
+        screen_width: u32,
+        dx: u32,
+        dy: u32,
+        w: u32,
+        h: u32,
+        src: *const u8,
+        pitch: usize,
+    ) {
+        let dst_stride = screen_width as usize * 4;
+        let row_bytes = w as usize * 4;
+        for row in 0..h as usize {
+            let dst_start = (dy as usize + row) * dst_stride + dx as usize * 4;
+            let dst = &mut buffer[dst_start..dst_start + row_bytes];
+            let src_row = unsafe { src.add(row * pitch) };
+            unsafe { std::ptr::copy_nonoverlapping(src_row, dst.as_mut_ptr(), row_bytes) };
+        }
+    }
+
+    /// GDI 兼容路径：复用同一块 DIB Section，BitBlt 直接写入像素内存。
+    struct GdiCapturer {
         width: u32,
         height: u32,
         screen_dc: HDC,
@@ -289,8 +697,8 @@ mod imp {
         bits_len: usize,
     }
 
-    impl ScreenCapturer {
-        pub fn new() -> io::Result<Self> {
+    impl GdiCapturer {
+        fn new() -> io::Result<Self> {
             let (w, h) = virtual_screen_size();
             let mut capturer = Self {
                 width: w,
@@ -304,10 +712,6 @@ mod imp {
             };
             capturer.init()?;
             Ok(capturer)
-        }
-
-        pub fn size(&self) -> (u32, u32) {
-            (self.width, self.height)
         }
 
         /// 按当前分辨率建立 DC / DIB Section，之后跨帧复用。
@@ -364,7 +768,7 @@ mod imp {
             Ok(())
         }
 
-        pub fn capture(&mut self) -> io::Result<Frame<'_>> {
+        fn capture(&mut self) -> io::Result<()> {
             unsafe {
                 let (w, h) = virtual_screen_size();
                 if (w, h) != (self.width, self.height) {
@@ -387,14 +791,12 @@ mod imp {
                 if ok == 0 {
                     return Err(io::Error::last_os_error());
                 }
-
-                let data = std::slice::from_raw_parts(self.bits, self.bits_len);
-                Ok(Frame {
-                    width: w,
-                    height: h,
-                    data,
-                })
+                Ok(())
             }
+        }
+
+        fn data(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.bits, self.bits_len) }
         }
 
         fn release(&mut self) {
@@ -421,7 +823,7 @@ mod imp {
         }
     }
 
-    impl Drop for ScreenCapturer {
+    impl Drop for GdiCapturer {
         fn drop(&mut self) {
             self.release();
         }
@@ -441,6 +843,10 @@ mod imp {
         (0, 0)
     }
 
+    pub fn virtual_screen_size() -> (u32, u32) {
+        (0, 0)
+    }
+
     pub struct ScreenCapturer;
 
     impl ScreenCapturer {
@@ -454,7 +860,7 @@ mod imp {
             (0, 0)
         }
         #[allow(unused_variables)]
-        pub fn capture(&mut self) -> io::Result<Frame<'_>> {
+        pub fn capture(&mut self) -> io::Result<Option<Frame<'_>>> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "当前平台暂不支持屏幕捕获",

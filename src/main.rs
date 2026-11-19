@@ -112,8 +112,25 @@ fn load_config(args: &Args) -> Config {
     cfg.clamped()
 }
 
+/// 让 GetSystemMetrics / GDI / DXGI 使用同一套物理像素坐标。
+/// 否则非 DPI 感知进程在 150% 缩放下会拿到 1280x720（逻辑），
+/// 而 DXGI 输出是 1920x1080（物理），导致画面截断。
+#[cfg(windows)]
+fn enable_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_dpi_awareness() {}
+
 fn main() {
     attach_console_if_needed();
+    enable_dpi_awareness();
     let args = parse_args();
     if args.help {
         print_help();

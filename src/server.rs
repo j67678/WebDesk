@@ -23,8 +23,8 @@ use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::capture::{
-    compute_hashes, encode_jpeg, extract_rgb, merge_dirty_rects, tile_grid, DiffDetector,
-    DirtyRect, Frame, ScreenCapturer, SharedFrame,
+    compute_hashes, encode_jpeg, extract_rgb, merge_dirty_rects, tile_grid, virtual_screen_size,
+    DiffDetector, DirtyRect, Frame, ScreenCapturer, SharedFrame,
 };
 use crate::config::{self, Config};
 use crate::input::{self, InputState};
@@ -451,7 +451,7 @@ fn spawn_capture_thread(
 
                 let t0 = std::time::Instant::now();
                 match capturer.capture() {
-                    Ok(frame) => {
+                    Ok(Some(frame)) => {
                         let (cols, rows) = tile_grid(frame.width, frame.height, tile_size);
                         let hashes = compute_hashes(&frame, tile_size, cols, rows);
                         let changed = match &last_frame {
@@ -472,6 +472,13 @@ fn spawn_capture_thread(
                         };
                         last_frame = Some(shared.clone());
                         hub.publish(shared);
+                    }
+                    Ok(None) => {
+                        // 本拍没有任何显示器更新（DXGI 空闲）：复用上一帧像素与哈希，
+                        // 代次仍递增，让新认证 / 请求全量刷新的客户端拿到当前画面。
+                        if let Some(last) = &last_frame {
+                            hub.publish(last.clone());
+                        }
                     }
                     Err(e) => log_warn!("截屏失败: {e}"),
                 }
@@ -531,9 +538,7 @@ async fn start_server(
     let viewers = Arc::new(AtomicUsize::new(0));
     let hub = Arc::new(FrameHub::new());
     let html = Arc::new(render_client_html(cfg.port));
-    let (screen_width, screen_height) = ScreenCapturer::new()
-        .map(|c| c.size())
-        .unwrap_or((1920, 1080));
+    let (screen_width, screen_height) = virtual_screen_size();
     if screen_width == 0 || screen_height == 0 {
         return Err("无法获取屏幕分辨率".into());
     }
@@ -890,9 +895,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 &mut rects,
             );
 
-            // 二进制帧：类型(1) + u16 矩形数 + [x,y,w,h u16][len u32][jpeg]
-            let mut payload = Vec::with_capacity(3 + rects.len() * 64);
-            payload.extend_from_slice(&[1u8, 0, 0]);
+            // 二进制帧：类型(1) + u16 矩形数 + u16 宽 + u16 高 + [x,y,w,h u16][len u32][jpeg]
+            let mut payload = Vec::with_capacity(7 + rects.len() * 64);
+            payload.extend_from_slice(&[1u8, 0, 0, 0, 0, 0, 0]);
             let mut count = 0u16;
             for rect in &rects {
                 extract_rgb(&frame, rect.x, rect.y, rect.w, rect.h, &mut rgb);
@@ -913,6 +918,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 continue;
             }
             payload[1..3].copy_from_slice(&count.to_le_bytes());
+            payload[3..5].copy_from_slice(&(shared.width.min(u16::MAX as u32) as u16).to_le_bytes());
+            payload[5..7].copy_from_slice(&(shared.height.min(u16::MAX as u32) as u16).to_le_bytes());
             match frame_tx.try_send(OutMsg::Binary(payload)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
