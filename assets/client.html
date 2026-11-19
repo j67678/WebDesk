@@ -303,6 +303,17 @@ let isConnected = false, requireAuth = false;
 let touchMode = 'tap';                 // tap | drag
 let frameCount = 0, tileCount = 0, byteCount = 0;
 let remoteTileSize = 64, decodeChain = Promise.resolve();
+let decodePending = 0, pendingDraw = new Map(), drawScheduled = false;
+let pendingMove = null, moveScheduled = false, lastFullRequest = 0;
+
+// 全量刷新请求去抖，避免解码失败时刷屏
+function requestFullOnce() {
+  const now = performance.now();
+  if (now - lastFullRequest > 1000) {
+    lastFullRequest = now;
+    send({ type: 'request_full' });
+  }
+}
 let lastStatTime = performance.now(), latencyMs = 0, pingStart = 0;
 let statTimer = null, pingTimer = null, notifTimer = null;
 let lastMoveSent = 0;
@@ -477,10 +488,17 @@ function onFrameBinary(buf) {
   for (const r of rects) {
     tileCount += Math.max(1, Math.round(r.w / ts)) * Math.max(1, Math.round(r.h / ts));
   }
-  // 串行解码 + 绘制，避免旧帧的瓦片覆盖新画面
+  // 解码积压过多：丢弃本帧差分并请求全量刷新，避免延迟无限增长
+  if (decodePending > 5) {
+    requestFullOnce();
+    return;
+  }
+  decodePending++;
+  // 串行解码，避免旧帧的瓦片覆盖新画面
   decodeChain = decodeChain
     .then(() => drawRects(rects))
-    .catch(() => {});
+    .catch(() => {})
+    .finally(() => { decodePending--; });
 }
 
 function drawRects(rects) {
@@ -488,11 +506,31 @@ function drawRects(rects) {
     createImageBitmap(new Blob([r.bytes], { type: 'image/jpeg' }))
       .then(bmp => ({ bmp, r }), () => null)
   )).then(items => {
+    let failed = false;
     for (const item of items) {
-      if (!item) continue;
+      if (!item) { failed = true; continue; }
+      // 同一坐标只保留最新瓦片
+      const key = item.r.x + ',' + item.r.y + ',' + item.r.w + ',' + item.r.h;
+      const prev = pendingDraw.get(key);
+      if (prev) prev.bmp.close();
+      pendingDraw.set(key, item);
+    }
+    scheduleDraw();
+    if (failed) requestFullOnce();
+  });
+}
+
+// 合并到下一次动画帧统一绘制，减少无效重绘
+function scheduleDraw() {
+  if (drawScheduled) return;
+  drawScheduled = true;
+  requestAnimationFrame(() => {
+    drawScheduled = false;
+    for (const item of pendingDraw.values()) {
       try { ctx.drawImage(item.bmp, item.r.x, item.r.y, item.r.w, item.r.h); } catch (e) {}
       item.bmp.close();
     }
+    pendingDraw.clear();
   });
 }
 
@@ -521,24 +559,43 @@ function updateCursor(cx, cy) {
   remoteCursor.style.left = (cx - r.left) + 'px';
   remoteCursor.style.top = (cy - r.top) + 'px';
 }
+// 点击 / 滚轮前把尚未发出的移动立即补发，避免在旧位置触发操作
+function flushMove() {
+  if (!pendingMove || !isConnected) { pendingMove = null; return; }
+  const p = toRemote(pendingMove.x, pendingMove.y);
+  send({ type: 'mousemove', x: p.x, y: p.y, button: pendingMove.button });
+  pendingMove = null;
+}
 
 // ── 鼠标 / 触控笔（桌面） ──────────────────────────────────────────
 wrapper.addEventListener('pointerdown', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
   e.preventDefault();
+  flushMove();
   const p = toRemote(e.clientX, e.clientY);
   send({ type: 'mousedown', x: p.x, y: p.y, button: e.button });
   wrapper.setPointerCapture(e.pointerId);
 });
 wrapper.addEventListener('pointermove', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
-  const p = toRemote(e.clientX, e.clientY);
+  // 本地光标立即跟随，网络发送合并到下一动画帧（高频鼠标不刷屏）
   updateCursor(e.clientX, e.clientY);
-  send({ type: 'mousemove', x: p.x, y: p.y, button: e.button });
+  pendingMove = { x: e.clientX, y: e.clientY, button: e.button };
+  if (!moveScheduled) {
+    moveScheduled = true;
+    requestAnimationFrame(() => {
+      moveScheduled = false;
+      if (!pendingMove || !isConnected) return;
+      const p = toRemote(pendingMove.x, pendingMove.y);
+      send({ type: 'mousemove', x: p.x, y: p.y, button: pendingMove.button });
+      pendingMove = null;
+    });
+  }
 });
 wrapper.addEventListener('pointerup', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
   e.preventDefault();
+  flushMove();
   const p = toRemote(e.clientX, e.clientY);
   send({ type: 'mouseup', x: p.x, y: p.y, button: e.button });
 });
@@ -546,6 +603,7 @@ wrapper.addEventListener('contextmenu', e => e.preventDefault());
 wrapper.addEventListener('wheel', e => {
   if (!isConnected) return;
   e.preventDefault();
+  flushMove();
   const p = toRemote(e.clientX, e.clientY);
   send({ type: 'wheel', x: p.x, y: p.y, deltaX: e.deltaX, deltaY: e.deltaY });
 }, { passive: false });

@@ -437,6 +437,7 @@ fn spawn_capture_thread(
 
             let mut last_frame: Option<Arc<SharedFrame>> = None;
             let mut idle = false;
+            let mut next_tick = std::time::Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 // 没有已认证客户端时不截屏，保持空闲零开销
                 if viewers.load(Ordering::Relaxed) == 0 {
@@ -445,11 +446,11 @@ fn spawn_capture_thread(
                         log_debug!("无认证客户端，捕获线程暂停");
                     }
                     std::thread::sleep(Duration::from_millis(50));
+                    next_tick = std::time::Instant::now();
                     continue;
                 }
                 idle = false;
 
-                let t0 = std::time::Instant::now();
                 match capturer.capture() {
                     Ok(Some(frame)) => {
                         let (cols, rows) = tile_grid(frame.width, frame.height, tile_size);
@@ -483,11 +484,22 @@ fn spawn_capture_thread(
                     Err(e) => log_warn!("截屏失败: {e}"),
                 }
 
-                let mut remain = interval.saturating_sub(t0.elapsed());
-                while remain > Duration::ZERO {
-                    let step = remain.min(Duration::from_millis(25));
-                    std::thread::sleep(step);
-                    remain -= step;
+                // 绝对节拍：以固定 deadline 对齐，避免逐帧累积漂移；
+                // 捕获耗时超过周期时不补帧，直接进入下一拍。
+                next_tick += interval;
+                let now = std::time::Instant::now();
+                if next_tick < now {
+                    next_tick = now;
+                }
+                loop {
+                    let now = std::time::Instant::now();
+                    let Some(remain) = next_tick.checked_duration_since(now) else {
+                        break;
+                    };
+                    if remain.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(remain.min(Duration::from_millis(25)));
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
