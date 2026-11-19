@@ -487,6 +487,10 @@ async function startWebRtc() {
     pc.addTransceiver('video', { direction: 'recvonly' });
 
     pc.ontrack = e => {
+      // 把接收端抖动缓冲压到浏览器允许的最小值（支持的 Chromium 内核生效）
+      if (e.receiver && 'playoutDelayHint' in e.receiver) {
+        try { e.receiver.playoutDelayHint = 0; } catch (_) {}
+      }
       if (e.streams && e.streams[0]) video.srcObject = e.streams[0];
     };
 
@@ -511,6 +515,10 @@ async function startWebRtc() {
     };
 
     const offer = await pc.createOffer();
+    // Chromium 私有 SDP 标记：关闭接收侧额外排队，局域网直连可少一整段缓冲延迟
+    if (offer.sdp && !offer.sdp.includes('x-google-flag:low-latency')) {
+      offer.sdp = offer.sdp.replace(/(^m=video[^\r\n]*\r?\n)/m, '$1a=x-google-flag:low-latency\r\n');
+    }
     await pc.setLocalDescription(offer);
 
     // non-trickle ICE：等收集完成再把完整 offer 发给服务端
@@ -632,8 +640,7 @@ function updateCursor(cx, cy) {
 // 点击 / 滚轮前把尚未发出的移动立即补发，避免在旧位置触发操作
 function flushMove() {
   if (!pendingMove || !isConnected) { pendingMove = null; return; }
-  const p = toRemote(pendingMove.x, pendingMove.y);
-  send({ type: 'mousemove', x: p.x, y: p.y, button: pendingMove.button });
+  send({ type: 'mousemove', x: pendingMove.x, y: pendingMove.y, button: pendingMove.button });
   pendingMove = null;
 }
 
@@ -650,16 +657,23 @@ wrapper.addEventListener('pointerdown', e => {
 });
 wrapper.addEventListener('pointermove', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
-  // 本地光标立即跟随，网络发送合并到下一动画帧（高频鼠标不刷屏）
   updateCursor(e.clientX, e.clientY);
-  pendingMove = { x: e.clientX, y: e.clientY, button: e.button };
+  const p = toRemote(e.clientX, e.clientY);
+  if (pressedButtons.size > 0) {
+    // 按住拖动窗口时每一条 pointermove 立即发出：等 rAF 会额外引入一帧
+    // （解码繁忙时可达 30ms+）延迟，且此时事件本身已被浏览器合并过。
+    pendingMove = null;
+    send({ type: 'mousemove', x: p.x, y: p.y, button: e.button });
+    return;
+  }
+  // 未按下时合并到下一动画帧，避免空闲高频鼠标刷屏
+  pendingMove = { x: p.x, y: p.y, button: e.button };
   if (!moveScheduled) {
     moveScheduled = true;
     requestAnimationFrame(() => {
       moveScheduled = false;
       if (!pendingMove || !isConnected) return;
-      const p = toRemote(pendingMove.x, pendingMove.y);
-      send({ type: 'mousemove', x: p.x, y: p.y, button: pendingMove.button });
+      send({ type: 'mousemove', x: pendingMove.x, y: pendingMove.y, button: pendingMove.button });
       pendingMove = null;
     });
   }
@@ -755,7 +769,7 @@ wrapper.addEventListener('touchmove', e => {
       T.moved = true; clearLongPress();
     }
     const now = performance.now();
-    if (now - lastMoveSent < 16) return;      // 节流，避免弱网洪泛
+    if (now - lastMoveSent < 8) return;       // 拖动节流放宽到 8ms，跟手优先
     lastMoveSent = now;
     const p = toRemote(t.clientX, t.clientY);
     send({ type: 'mousemove', x: p.x, y: p.y, button: T.dragDown ? 0 : 0 });

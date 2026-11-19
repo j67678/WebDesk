@@ -54,7 +54,7 @@ port = 8765
 password_hash =
 
 [performance]
-fps = 15
+fps = 30
 # 旧版 JPEG 差分遗留项，WebRTC 迁移后不再生效
 tile_size = 64
 quality = 75
@@ -75,7 +75,7 @@ open_browser = false
 | `port` | 监听端口 | `8765` |
 | `password_hash` | 访问密码哈希，留空表示无密码 | 空 |
 | `password` | 旧版明文密码，兼容读取，建议改用 `password_hash` | 空 |
-| `fps` | 最大帧率 / 编码节拍（1-60） | `15` |
+| `fps` | 最大帧率 / 编码节拍（1-60）；局域网拖动窗口建议 30 | `30` |
 | `tile_size` | 旧版遗留项，已失效 | `64` |
 | `quality` | 旧版遗留项，已失效 | `75` |
 | `bitrate_kbps` | H.264 目标码率（300-20000），弱网下可自动下调 | `2500` |

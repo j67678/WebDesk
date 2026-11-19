@@ -512,7 +512,7 @@ impl WebDeskApp {
         ui.heading("画面与性能");
         ui.add_space(8.0);
         ui.add(egui::Slider::new(&mut self.cfg.fps, 1..=60).text("最大帧率 FPS"));
-        ui.label(RichText::new("局域网建议 20-30，弱网建议 10-15").color(Color32::GRAY));
+        ui.label(RichText::new("局域网建议 30，追求跟手可试 45-60；弱网建议 10-15").color(Color32::GRAY));
         ui.add_space(8.0);
         ui.add(
             egui::Slider::new(&mut self.cfg.bitrate_kbps, 300..=20_000)

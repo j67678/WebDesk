@@ -47,7 +47,7 @@ impl Default for Config {
             port: 8765,
             password_hash: String::new(),
             password_plain: String::new(),
-            fps: 15,
+            fps: 30,
             tile_size: 64,
             quality: 75,
             bitrate_kbps: 2500,
