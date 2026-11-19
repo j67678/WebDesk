@@ -386,7 +386,7 @@ function closePeer() {
   }
   // 重建连接后解码计数从 0 开始，重置基准避免停滞检测误判
   lastRtcStats = { frames: 0, bytes: 0, lost: 0, received: 0 };
-  lastDecodedFrames = 0; decodedStallAt = 0;
+  lastDecodedFrames = 0; decodedStallAt = 0; stallKeyframeAttempts = 0;
   lastRcvLost = 0; lastRcvReceived = 0;
 }
 
@@ -546,22 +546,29 @@ async function collectRtcStats() {
         const bytes = r.bytesReceived || 0;
         const lost = r.packetsLost || 0;
         const received = r.packetsReceived || 0;
+        const recvDelta = Math.max(0, received - lastRtcStats.received);
         frameCount += Math.max(0, frames - lastRtcStats.frames);
         byteCount += Math.max(0, bytes - lastRtcStats.bytes) * 8; // bit
         lastRtcStats = { frames, bytes, lost, received };
 
         const now = performance.now();
 
-        // 解码停滞自救：偶发的解码器状态卡死会表现为有收包但无新帧，
-        // 连续 4 秒无新增解码帧则请求 IDR，避免画面永久冻结。
+        // 解码停滞自救：有收包但无新解码帧时，可能是参考帧丢失导致解码器卡死。
+        // 关键帧采用递增退避（4s→8s→16s→30s）且最多请求 4 次；
+        // 连续请求 IDR 会放大拥塞，反而让画面一直冻结、带宽被占满。
         if (frames > lastDecodedFrames) {
           lastDecodedFrames = frames;
           decodedStallAt = 0;
-        } else if (decodedStallAt === 0) {
-          decodedStallAt = now;
-        } else if (now - decodedStallAt >= 4000) {
-          requestKeyframe();
-          decodedStallAt = now - 3000; // 之后每秒重试一次
+          stallKeyframeAttempts = 0;
+        } else {
+          if (decodedStallAt === 0) decodedStallAt = now;
+          const backoffMs = Math.min(4000 * Math.pow(2, stallKeyframeAttempts), 30000);
+          // 完全收不到包（网络中断）时请求 IDR 无意义；已到码率下限时也不再请求。
+          if (now - decodedStallAt >= backoffMs && recvDelta > 0
+              && !bitrateAtFloor && stallKeyframeAttempts < 4) {
+            requestKeyframe();
+            stallKeyframeAttempts++;
+          }
         }
 
         if (now - lastAdaptAt >= 3000 && received > lastRcvReceived + 30) {
@@ -594,7 +601,7 @@ async function collectRtcStats() {
   } catch (e) {}
 }
 let lastRcvLost = 0, lastRcvReceived = 0;
-let lastDecodedFrames = 0, decodedStallAt = 0;
+let lastDecodedFrames = 0, decodedStallAt = 0, stallKeyframeAttempts = 0;
 
 // ── 缩放 / 坐标 ────────────────────────────────────────────────────
 function applyZoom(z) {

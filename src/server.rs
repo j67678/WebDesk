@@ -46,9 +46,12 @@ const KEY_STICKY_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_TICK: Duration = Duration::from_secs(2);
 /// 出站帧队列容量。有界队列 + 丢弃策略，避免慢客户端拖垮内存。
 const OUT_QUEUE_CAP: usize = 8;
-/// 画面静止时的保活刷新间隔：避免完全停流导致浏览器解码器误判卡死。
-/// 静止帧压缩后只有极小体积，百毫秒级保活开销可忽略。
-const STATIC_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+/// 画面静止时的保活刷新间隔。不必以帧率高频发送：H.264 P 帧的时序由
+/// RTP 时间戳维持，低频保活即可避免中间设备因长时间无包而回收会话。
+const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// 关键帧的最小间隔。客户端弱网自救会周期性请求 IDR，若不设下限，
+/// 每次 IDR 都会占满带宽并加剧丢包，形成“画面冻结 + 带宽饱和”的闭环。
+const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Mutex 被污染时不连锁 panic（否则一条连接的异常会毒死整个服务状态）。
 fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status> {
@@ -592,6 +595,7 @@ fn spawn_encoder_thread(
             // 静态画面跳过编码：仅按固定间隔发一帧保活，像素变化才恢复满帧率。
             let mut last_source: Option<Arc<SharedFrame>> = None;
             let mut last_publish = Instant::now();
+            let mut last_keyframe = Instant::now();
             let mut skipped_since_publish = false;
 
             while !stop.load(Ordering::Relaxed) {
@@ -628,9 +632,14 @@ fn spawn_encoder_thread(
                         }
                     }
                 }
-                if want_keyframe {
+                // 关键帧限频：忽略过密请求，避免 IDR 风暴把带宽打满。
+                // 被限流的请求不参与下方的“强制编码”判定。
+                let mut keyframe_granted = false;
+                if want_keyframe && last_keyframe.elapsed() >= KEYFRAME_MIN_INTERVAL {
                     if let Some(enc) = encoder.as_mut() {
                         enc.request_keyframe();
+                        last_keyframe = Instant::now();
+                        keyframe_granted = true;
                     }
                 }
 
@@ -647,14 +656,17 @@ fn spawn_encoder_thread(
                     .as_ref()
                     .map_or(true, |prev| prev.data.as_slice() != shared.data.as_slice());
                 let refresh_due = last_publish.elapsed() >= STATIC_REFRESH_INTERVAL;
-                if !changed && !want_keyframe && !bitrate_changed && !refresh_due {
+                if !changed && !keyframe_granted && !bitrate_changed && !refresh_due {
                     skipped_since_publish = true;
                     continue;
                 }
                 // 静止后恢复变化时立即发 IDR，避免 P 帧参考丢失导致点击后等下一个 GOP。
-                if changed && skipped_since_publish {
+                if changed && skipped_since_publish
+                    && last_keyframe.elapsed() >= KEYFRAME_MIN_INTERVAL
+                {
                     if let Some(enc) = encoder.as_mut() {
                         enc.request_keyframe();
+                        last_keyframe = Instant::now();
                     }
                 }
 
@@ -687,6 +699,9 @@ fn spawn_encoder_thread(
                     Ok(data) if !data.is_empty() => {
                         encoded_bytes += data.len();
                         let is_keyframe = contains_idr(&data);
+                        if is_keyframe {
+                            last_keyframe = Instant::now();
+                        }
                         encoded_hub.publish(EncodedFrame {
                             generation,
                             data: Arc::new(data),
