@@ -302,6 +302,7 @@ let zoom = 1.0, manualZoom = false;
 let isConnected = false, requireAuth = false;
 let touchMode = 'tap';                 // tap | drag
 let frameCount = 0, tileCount = 0, byteCount = 0;
+let remoteTileSize = 64, decodeChain = Promise.resolve();
 let lastStatTime = performance.now(), latencyMs = 0, pingStart = 0;
 let statTimer = null, pingTimer = null, notifTimer = null;
 let lastMoveSent = 0;
@@ -400,6 +401,8 @@ function submitAuth() {
 
 // ── 消息处理 ───────────────────────────────────────────────────────
 function onMessage(evt) {
+  // 画面帧走二进制，控制消息仍为 JSON 文本
+  if (evt.data instanceof ArrayBuffer) { onFrameBinary(evt.data); return; }
   let d; try { d = JSON.parse(evt.data); } catch (e) { return; }
 
   if (d.type === 'auth_result') {
@@ -422,6 +425,7 @@ function onMessage(evt) {
     requireAuth = false;
     remoteWidth = d.width || remoteWidth;
     remoteHeight = d.height || remoteHeight;
+    remoteTileSize = d.tile_size || remoteTileSize;
     canvas.width = remoteWidth; canvas.height = remoteHeight;
     ctx.fillStyle = '#111'; ctx.fillRect(0, 0, remoteWidth, remoteHeight);
     fitToWindow();
@@ -434,18 +438,50 @@ function onMessage(evt) {
     return;
   }
 
-  if (d.type === 'frame') {
-    const tiles = d.tiles || [];
-    frameCount++; tileCount += tiles.length;
-    for (const t of tiles) {
-      const img = new Image();
-      img.onload = () => {
-        try { ctx.drawImage(img, t.x, t.y, t.w, t.h); } catch (e) {}
-      };
-      byteCount += (t.data.length || 0) * 0.75;
-      img.src = `data:image/${t.fmt === 'png' ? 'png' : 'jpeg'};base64,${t.data}`;
-    }
+}
+
+// ── 二进制画面帧 ───────────────────────────────────────────────────
+// 格式：u8 类型=1 | u16 矩形数 | 每块 [x,y,w,h u16][len u32][jpeg 字节]
+function onFrameBinary(buf) {
+  const view = new DataView(buf);
+  if (buf.byteLength < 3 || view.getUint8(0) !== 1) return;
+  const count = view.getUint16(1, true);
+  const rects = [];
+  let off = 3, bytes = 0;
+  for (let i = 0; i < count; i++) {
+    if (off + 12 > buf.byteLength) return;
+    const x = view.getUint16(off, true), y = view.getUint16(off + 2, true);
+    const w = view.getUint16(off + 4, true), h = view.getUint16(off + 6, true);
+    const len = view.getUint32(off + 8, true);
+    off += 12;
+    if (off + len > buf.byteLength) return;
+    rects.push({ x, y, w, h, bytes: new Uint8Array(buf, off, len) });
+    off += len;
+    bytes += len;
   }
+  frameCount++;
+  byteCount += bytes;
+  const ts = remoteTileSize || 64;
+  for (const r of rects) {
+    tileCount += Math.max(1, Math.round(r.w / ts)) * Math.max(1, Math.round(r.h / ts));
+  }
+  // 串行解码 + 绘制，避免旧帧的瓦片覆盖新画面
+  decodeChain = decodeChain
+    .then(() => drawRects(rects))
+    .catch(() => {});
+}
+
+function drawRects(rects) {
+  return Promise.all(rects.map(r =>
+    createImageBitmap(new Blob([r.bytes], { type: 'image/jpeg' }))
+      .then(bmp => ({ bmp, r }), () => null)
+  )).then(items => {
+    for (const item of items) {
+      if (!item) continue;
+      try { ctx.drawImage(item.bmp, item.r.x, item.r.y, item.r.w, item.r.h); } catch (e) {}
+      item.bmp.close();
+    }
+  });
 }
 
 // ── 缩放 / 坐标 ────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 //!
 //! Windows 使用 CreateDIBSection + BitBlt 把虚拟桌面直接画进 BGRA 缓冲（支持多显示器），
 //! 捕获资源与像素缓冲跨帧复用，不再每帧重建 GDI 对象或复制整屏；
-//! 差分按瓦片做容差哈希，只编码变化的区域，瓦片 RGB 缓冲同样跨帧复用。
+//! 差分按瓦片做容差哈希，相邻脏瓦片合并成矩形后再编码，减少 JPEG 头开销。
 
 use std::io::{self, Cursor};
 
@@ -16,25 +16,13 @@ pub struct Frame<'a> {
     pub data: &'a [u8],
 }
 
-pub struct Tile {
+/// 合并后的脏矩形（像素坐标），一次编码 / 一次下发的单位。
+#[derive(Clone, Copy, Debug)]
+pub struct DirtyRect {
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// 已转换为 RGB8，可直接送 JPEG 编码器（缓冲跨帧复用）
-    pub rgb: Vec<u8>,
-}
-
-impl Tile {
-    fn empty() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0,
-            rgb: Vec::new(),
-        }
-    }
 }
 
 pub use imp::{virtual_screen_origin, ScreenCapturer};
@@ -79,26 +67,21 @@ pub fn compute_hashes(frame: &Frame<'_>, tile_size: u32, cols: usize, rows: usiz
 
 /// 每个 WebSocket 连接独立维护一份瓦片哈希，避免跨会话串扰。
 pub struct DiffDetector {
-    tile_size: u32,
     prev: Vec<u64>,
     cols: usize,
     rows: usize,
     initialized: bool,
-    /// 与网格一一对应的瓦片槽位；rgb 缓冲只在分辨率变化时重新分配
-    tiles: Vec<Tile>,
     /// 本帧变化瓦片的下标（按扫描顺序）
     changed: Vec<usize>,
 }
 
 impl DiffDetector {
-    pub fn new(tile_size: u32) -> Self {
+    pub fn new() -> Self {
         Self {
-            tile_size: tile_size.clamp(16, 256),
             prev: Vec::new(),
             cols: 0,
             rows: 0,
             initialized: false,
-            tiles: Vec::new(),
             changed: Vec::new(),
         }
     }
@@ -108,11 +91,9 @@ impl DiffDetector {
         self.prev.clear();
     }
 
-    /// 用捕获线程算好的全局哈希与本会话上一帧做差集：
-    /// 结果保存在内部槽位，通过 `changed()` 取下标、`tile()` 取瓦片；
-    /// 首帧或尺寸变化时全部瓦片都视为变化。
-    pub fn diff(&mut self, frame: &Frame<'_>, hashes: &[u64], cols: usize, rows: usize) {
-        let ts = self.tile_size;
+    /// 用捕获线程算好的全局哈希与本会话上一帧做差集，
+    /// 变化瓦片的下标通过 `changed()` 读取；首帧或尺寸变化时全部视为变化。
+    pub fn diff(&mut self, hashes: &[u64], cols: usize, rows: usize) {
         let full = !self.initialized || self.cols != cols || self.rows != rows;
         self.cols = cols;
         self.rows = rows;
@@ -123,30 +104,16 @@ impl DiffDetector {
         if self.prev.len() != slots {
             self.prev.resize(slots, 0);
         }
-        if self.tiles.len() != slots {
-            self.tiles.clear();
-            self.tiles.resize_with(slots, Tile::empty);
-        }
         self.changed.clear();
 
-        for row in 0..rows {
-            for col in 0..cols {
-                let idx = row * cols + col;
-                if !full && hashes[idx] == self.prev[idx] {
-                    continue;
-                }
-                self.prev[idx] = hashes[idx];
-
-                let x = (col as u32) * ts;
-                let y = (row as u32) * ts;
-                let w = ts.min(frame.width - x);
-                let h = ts.min(frame.height - y);
-                let slot = &mut self.tiles[idx];
-                slot.x = x;
-                slot.y = y;
-                slot.w = w;
-                slot.h = h;
-                fill_rgb(frame, slot);
+        if full {
+            self.changed.extend(0..slots);
+            self.prev.copy_from_slice(hashes);
+            return;
+        }
+        for (idx, &hash) in hashes.iter().enumerate() {
+            if hash != self.prev[idx] {
+                self.prev[idx] = hash;
                 self.changed.push(idx);
             }
         }
@@ -156,10 +123,64 @@ impl DiffDetector {
     pub fn changed(&self) -> &[usize] {
         &self.changed
     }
+}
 
-    /// 按下标读取瓦片（坐标与 RGB 数据）。
-    pub fn tile(&self, idx: usize) -> &Tile {
-        &self.tiles[idx]
+/// 把相邻变化瓦片合并成矩形，减少 JPEG 编码次数与每块 JPEG 的头开销。
+///
+/// 先按行找连续脏瓦片，再向上/下扩展整段都脏的行；合并结果写入 `out`
+/// （由调用方复用，避免每帧分配）。所有矩形互不重叠。
+pub fn merge_dirty_rects(
+    changed: &[usize],
+    cols: usize,
+    rows: usize,
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    out: &mut Vec<DirtyRect>,
+) {
+    let ts = tile_size.clamp(16, 256);
+    let mut dirty = vec![false; cols * rows];
+    for &idx in changed {
+        if idx < dirty.len() {
+            dirty[idx] = true;
+        }
+    }
+
+    for row in 0..rows {
+        let mut col = 0;
+        while col < cols {
+            if !dirty[row * cols + col] {
+                col += 1;
+                continue;
+            }
+            let c0 = col;
+            while col < cols && dirty[row * cols + col] {
+                col += 1;
+            }
+            let c1 = col; // 不含
+
+            // 向下扩展：整段仍然全脏才并入同一矩形
+            let mut r_end = row + 1;
+            while r_end < rows && (c0..c1).all(|c| dirty[r_end * cols + c]) {
+                r_end += 1;
+            }
+            for r in row..r_end {
+                for c in c0..c1 {
+                    dirty[r * cols + c] = false;
+                }
+            }
+
+            let x = c0 as u32 * ts;
+            let y = row as u32 * ts;
+            let x_end = ((c1 as u32) * ts).min(width);
+            let y_end = ((r_end as u32) * ts).min(height);
+            out.push(DirtyRect {
+                x,
+                y,
+                w: x_end.saturating_sub(x),
+                h: y_end.saturating_sub(y),
+            });
+        }
     }
 }
 
@@ -186,19 +207,19 @@ fn tile_hash(frame: &Frame<'_>, x: u32, y: u32, w: u32, h: u32) -> u64 {
     hash
 }
 
-/// 把瓦片的 BGRA 像素转换进已复用的 RGB 缓冲，避免逐帧分配。
-fn fill_rgb(frame: &Frame<'_>, tile: &mut Tile) {
-    let w = tile.w as usize;
-    let h = tile.h as usize;
+/// 把任意矩形的 BGRA 像素转换进已复用的 RGB 缓冲，避免逐帧分配。
+pub fn extract_rgb(frame: &Frame<'_>, x: u32, y: u32, w: u32, h: u32, out: &mut Vec<u8>) {
+    let w = w as usize;
+    let h = h as usize;
     let stride = frame.width as usize * 4;
     let row_bytes = w * 3;
-    tile.rgb.resize(row_bytes * h, 0);
+    out.resize(row_bytes * h, 0);
 
     for row in 0..h {
-        let src_start = (tile.y as usize + row) * stride + tile.x as usize * 4;
-        // GetDIBits / DIB 均为 BGRA
+        let src_start = (y as usize + row) * stride + x as usize * 4;
+        // DIB 为 BGRA
         let src = &frame.data[src_start..src_start + w * 4];
-        let dst = &mut tile.rgb[row * row_bytes..(row + 1) * row_bytes];
+        let dst = &mut out[row * row_bytes..(row + 1) * row_bytes];
         for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(3)) {
             d[0] = s[2];
             d[1] = s[1];
@@ -207,16 +228,11 @@ fn fill_rgb(frame: &Frame<'_>, tile: &mut Tile) {
     }
 }
 
-pub fn encode_jpeg(tile: &Tile, quality: u8) -> io::Result<Vec<u8>> {
-    let mut out = Cursor::new(Vec::with_capacity(tile.rgb.len() / 4));
+pub fn encode_jpeg(rgb: &[u8], w: u32, h: u32, quality: u8) -> io::Result<Vec<u8>> {
+    let mut out = Cursor::new(Vec::with_capacity(rgb.len() / 4));
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
     encoder
-        .encode(
-            &tile.rgb,
-            tile.w,
-            tile.h,
-            image::ExtendedColorType::Rgb8,
-        )
+        .encode(rgb, w, h, image::ExtendedColorType::Rgb8)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     Ok(out.into_inner())
 }

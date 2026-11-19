@@ -17,14 +17,14 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::capture::{
-    compute_hashes, encode_jpeg, tile_grid, DiffDetector, Frame, ScreenCapturer, SharedFrame,
+    compute_hashes, encode_jpeg, extract_rgb, merge_dirty_rects, tile_grid, DiffDetector,
+    DirtyRect, Frame, ScreenCapturer, SharedFrame,
 };
 use crate::config::{self, Config};
 use crate::input::{self, InputState};
@@ -35,7 +35,6 @@ use crate::log_warn;
 use crate::protocol::{auth_backoff_ms, ClientMessage, MAX_AUTH_FAILURES};
 
 const BOOT_MARKER: &str = "/*__WEBDESK_BOOT__*/";
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 /// 同时在线的 WebSocket 客户端上限。每个连接都独占一份全屏缓冲与截屏线程，
 /// 不设上限时异常/恶意重连会把内存与线程耗尽。
@@ -128,6 +127,12 @@ enum Command {
     Stop,
     SetPassword { hash: String, plain: String },
     Shutdown,
+}
+
+/// 出站消息：控制消息保持 JSON 文本，画面帧走二进制以省掉 Base64 与 JSON 转义。
+enum OutMsg {
+    Text(String),
+    Binary(Vec<u8>),
 }
 
 /// GUI / headless 共用的服务控制器：内部独占一个 tokio runtime 线程。
@@ -772,9 +777,9 @@ impl Drop for ViewerGuard {
 }
 
 /// 带超时的文本发送：慢客户端不能把接收循环卡死在 `tx.send().await`。
-async fn send_text(tx: &mpsc::Sender<String>, text: String) -> bool {
+async fn send_text(tx: &mpsc::Sender<OutMsg>, text: String) -> bool {
     matches!(
-        tokio::time::timeout(WRITE_TIMEOUT, tx.send(text)).await,
+        tokio::time::timeout(WRITE_TIMEOUT, tx.send(OutMsg::Text(text))).await,
         Ok(Ok(()))
     )
 }
@@ -801,7 +806,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let conn_stop = Arc::new(AtomicBool::new(false));
 
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<String>(OUT_QUEUE_CAP);
+    let (tx, mut rx) = mpsc::channel::<OutMsg>(OUT_QUEUE_CAP);
 
     // 认证前后都先发 init（旧客户端依赖它决定弹不弹密码框）
     if !send_text(&tx, init_payload(&state, require_auth)).await {
@@ -809,9 +814,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 
     let mut writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        while let Some(out) = rx.recv().await {
+            let msg = match out {
+                OutMsg::Text(text) => Message::Text(text),
+                OutMsg::Binary(bytes) => Message::Binary(bytes),
+            };
             // 客户端长期不读 TCP 时主动断开，避免写任务与缓冲长期驻留
-            match tokio::time::timeout(WRITE_TIMEOUT, sink.send(Message::Text(msg))).await {
+            match tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => break,
                 Err(_) => {
@@ -835,8 +844,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let tile_size = state.tile_size;
     let quality = state.quality;
     let mut frame_task = tokio::task::spawn_blocking(move || {
-        let mut detector = DiffDetector::new(tile_size);
+        let mut detector = DiffDetector::new();
         let mut last_gen = 0u64;
+        let mut rects: Vec<DirtyRect> = Vec::new();
+        let mut rgb: Vec<u8> = Vec::new();
 
         while !frame_stop.load(Ordering::Relaxed)
             && !server_stop.load(Ordering::Relaxed)
@@ -862,34 +873,47 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 height: shared.height,
                 data: &shared.data,
             };
-            detector.diff(&frame, &shared.hashes, shared.cols, shared.rows);
+            detector.diff(&shared.hashes, shared.cols, shared.rows);
             if detector.changed().is_empty() {
                 continue;
             }
 
-            // 瓦片槽位与 RGB 缓冲由 detector 复用，这里只读取
-            let encoded: Vec<_> = detector
-                .changed()
-                .iter()
-                .filter_map(|&idx| {
-                    let t = detector.tile(idx);
-                    match encode_jpeg(t, quality) {
-                        Ok(jpeg) => Some(json!({
-                            "x": t.x, "y": t.y, "w": t.w, "h": t.h,
-                            "data": B64.encode(jpeg), "fmt": "jpeg"
-                        })),
-                        Err(e) => {
-                            log_warn!("JPEG 编码失败: {e}");
-                            None
-                        }
+            // 相邻脏瓦片合并成矩形：全屏变化时只需编码 1 块，避免数百个 JPEG 头
+            rects.clear();
+            merge_dirty_rects(
+                detector.changed(),
+                shared.cols,
+                shared.rows,
+                shared.width,
+                shared.height,
+                tile_size,
+                &mut rects,
+            );
+
+            // 二进制帧：类型(1) + u16 矩形数 + [x,y,w,h u16][len u32][jpeg]
+            let mut payload = Vec::with_capacity(3 + rects.len() * 64);
+            payload.extend_from_slice(&[1u8, 0, 0]);
+            let mut count = 0u16;
+            for rect in &rects {
+                extract_rgb(&frame, rect.x, rect.y, rect.w, rect.h, &mut rgb);
+                match encode_jpeg(&rgb, rect.w, rect.h, quality) {
+                    Ok(jpeg) => {
+                        payload.extend_from_slice(&(rect.x as u16).to_le_bytes());
+                        payload.extend_from_slice(&(rect.y as u16).to_le_bytes());
+                        payload.extend_from_slice(&(rect.w as u16).to_le_bytes());
+                        payload.extend_from_slice(&(rect.h as u16).to_le_bytes());
+                        payload.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(&jpeg);
+                        count = count.saturating_add(1);
                     }
-                })
-                .collect();
-            if encoded.is_empty() {
+                    Err(e) => log_warn!("JPEG 编码失败: {e}"),
+                }
+            }
+            if count == 0 {
                 continue;
             }
-            let payload = json!({"type": "frame", "tiles": encoded}).to_string();
-            match frame_tx.try_send(payload) {
+            payload[1..3].copy_from_slice(&count.to_le_bytes());
+            match frame_tx.try_send(OutMsg::Binary(payload)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // 慢客户端：丢弃本帧并请求下一帧全量刷新，保证画面最终一致
