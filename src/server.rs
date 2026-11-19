@@ -46,11 +46,9 @@ const KEY_STICKY_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_TICK: Duration = Duration::from_secs(2);
 /// 出站帧队列容量。有界队列 + 丢弃策略，避免慢客户端拖垮内存。
 const OUT_QUEUE_CAP: usize = 8;
-/// 画面静止时的保活刷新间隔：避免完全停流导致解码器误判卡死，
-/// 同时把静态带宽从满码率降到接近 0。
-const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-/// 单帧 RTP 时间跨度上限，防止长时间静止后播放时间轴跳变。
-const MAX_SAMPLE_DURATION: Duration = Duration::from_millis(2200);
+/// 画面静止时的保活刷新间隔：避免完全停流导致浏览器解码器误判卡死。
+/// 静止帧压缩后只有极小体积，百毫秒级保活开销可忽略。
+const STATIC_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Mutex 被污染时不连锁 panic（否则一条连接的异常会毒死整个服务状态）。
 fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status> {
@@ -1211,16 +1209,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     }
                                 });
                                 let interval = state.frame_interval;
-                                let max_duration = MAX_SAMPLE_DURATION.max(interval);
                                 media_task = Some(tokio::spawn(async move {
                                     let mut written = 0u64;
                                     let mut last_log = Instant::now();
-                                    let mut last_write = Instant::now();
                                     while let Some(frame) = frame_rx.recv().await {
                                         let data = (*frame.data).clone();
-                                        // 静态跳帧后按真实间隔推进 RTP 时间戳，避免播放时间轴变慢。
-                                        let duration = last_write.elapsed().clamp(interval, max_duration);
-                                        last_write = Instant::now();
+                                        // 关键：TrackLocalStaticSample 用本帧 duration 推进「下一帧」
+                                        // 的 RTP 时间戳。必须恒等于标称帧间隔，绝不能用实际写帧间隔
+                                        // (elapsed)——那是旧版点击延迟 2~3 秒的根因：静止期 elapsed
+                                        // 累积到秒级，把点击后第一帧的时间戳顶到数秒之后，浏览器
+                                        // 抖动缓冲按时间戳排队，画面因此"迟钝"。
+                                        let duration = interval;
                                         if let Err(e) = track_writer.write_h264(data, duration).await {
                                             log_warn!("WebRTC 写帧失败: {e}");
                                             break;
