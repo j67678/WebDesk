@@ -221,7 +221,7 @@
 
 <div id="viewport">
   <div id="canvas-wrapper">
-    <video id="screen-video" autoplay playsinline muted></video>
+    <video id="screen-video" autoplay playsinline muted disablePictureInPicture controlsList="nodownload nofullscreen noremoteplayback"></video>
     <svg id="remote-cursor" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
       <polygon points="1,1 1,13 4,10 7,15 9,14 6,9 10,9" fill="white" stroke="black" stroke-width="1"/>
     </svg>
@@ -312,6 +312,9 @@ let lastMoveSent = 0;
 
 const $ = id => document.getElementById(id);
 const video = $('screen-video');
+// 兼容性回退：确保 Edge/Chromium 不显示原生画中画、下载、全屏、远程播放等悬浮按钮
+video.disablePictureInPicture = true;
+video.controlsList = 'nodownload nofullscreen noremoteplayback';
 const overlay = $('overlay'), viewport = $('viewport'), wrapper = $('canvas-wrapper');
 const authDialog = $('auth-dialog'), authPassword = $('auth-password'), authError = $('auth-error');
 const rememberPassword = $('remember-password'), remoteCursor = $('remote-cursor');
