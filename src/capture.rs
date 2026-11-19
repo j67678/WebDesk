@@ -39,6 +39,44 @@ impl Tile {
 
 pub use imp::{virtual_screen_origin, ScreenCapturer};
 
+/// 捕获线程产出的共享帧：像素 + 全局瓦片哈希。
+///
+/// 同一帧可被多个客户端并发读取：捕获与哈希全服务只做一次，
+/// 各客户端只按自己的上一帧哈希做差集，提取需要的瓦片。
+pub struct SharedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub cols: usize,
+    pub rows: usize,
+    pub hashes: Vec<u64>,
+    pub data: Vec<u8>,
+}
+
+/// 瓦片网格行列数（与 `DiffDetector` 使用同一钳制范围）。
+pub fn tile_grid(width: u32, height: u32, tile_size: u32) -> (usize, usize) {
+    let ts = tile_size.clamp(16, 256) as usize;
+    (
+        (width as usize + ts - 1) / ts,
+        (height as usize + ts - 1) / ts,
+    )
+}
+
+/// 全帧瓦片哈希（行优先），由捕获线程每帧算一次供所有客户端复用。
+pub fn compute_hashes(frame: &Frame<'_>, tile_size: u32, cols: usize, rows: usize) -> Vec<u64> {
+    let ts = tile_size.clamp(16, 256);
+    let mut hashes = vec![0u64; cols * rows];
+    for row in 0..rows {
+        for col in 0..cols {
+            let x = (col as u32) * ts;
+            let y = (row as u32) * ts;
+            let w = ts.min(frame.width - x);
+            let h = ts.min(frame.height - y);
+            hashes[row * cols + col] = tile_hash(frame, x, y, w, h);
+        }
+    }
+    hashes
+}
+
 /// 每个 WebSocket 连接独立维护一份瓦片哈希，避免跨会话串扰。
 pub struct DiffDetector {
     tile_size: u32,
@@ -70,18 +108,18 @@ impl DiffDetector {
         self.prev.clear();
     }
 
-    /// 计算本帧变化的瓦片：结果保存在内部槽位，通过 `changed()` 取下标、
-    /// `tile()` 取瓦片；首帧或尺寸变化时全部瓦片都视为变化。
-    pub fn diff(&mut self, frame: &Frame<'_>) {
+    /// 用捕获线程算好的全局哈希与本会话上一帧做差集：
+    /// 结果保存在内部槽位，通过 `changed()` 取下标、`tile()` 取瓦片；
+    /// 首帧或尺寸变化时全部瓦片都视为变化。
+    pub fn diff(&mut self, frame: &Frame<'_>, hashes: &[u64], cols: usize, rows: usize) {
         let ts = self.tile_size;
-        let cols = (frame.width as usize + ts as usize - 1) / ts as usize;
-        let rows = (frame.height as usize + ts as usize - 1) / ts as usize;
         let full = !self.initialized || self.cols != cols || self.rows != rows;
         self.cols = cols;
         self.rows = rows;
         self.initialized = true;
 
         let slots = cols * rows;
+        debug_assert_eq!(hashes.len(), slots);
         if self.prev.len() != slots {
             self.prev.resize(slots, 0);
         }
@@ -94,22 +132,22 @@ impl DiffDetector {
         for row in 0..rows {
             for col in 0..cols {
                 let idx = row * cols + col;
+                if !full && hashes[idx] == self.prev[idx] {
+                    continue;
+                }
+                self.prev[idx] = hashes[idx];
+
                 let x = (col as u32) * ts;
                 let y = (row as u32) * ts;
                 let w = ts.min(frame.width - x);
                 let h = ts.min(frame.height - y);
-                let hash = tile_hash(frame, x, y, w, h);
-                let changed = full || hash != self.prev[idx];
-                self.prev[idx] = hash;
-                if changed {
-                    let slot = &mut self.tiles[idx];
-                    slot.x = x;
-                    slot.y = y;
-                    slot.w = w;
-                    slot.h = h;
-                    fill_rgb(frame, slot);
-                    self.changed.push(idx);
-                }
+                let slot = &mut self.tiles[idx];
+                slot.x = x;
+                slot.y = y;
+                slot.w = w;
+                slot.h = h;
+                fill_rgb(frame, slot);
+                self.changed.push(idx);
             }
         }
     }
