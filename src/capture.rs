@@ -6,6 +6,7 @@
 //! 差分按瓦片做容差哈希，相邻脏瓦片合并成矩形后再编码，减少 JPEG 头开销。
 
 use std::io::{self, Cursor};
+use std::time::Instant;
 
 /// 一帧原始画面：BGRA、top-down。
 ///
@@ -36,6 +37,9 @@ pub struct SharedFrame {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+    /// 帧真正被捕获的时刻。RTP 时间戳用它推进，避免编码耗时抖动
+    /// 被浏览器抖动缓冲累积成越来越深的画面延迟。
+    pub captured_at: Instant,
 }
 
 /// 瓦片网格行列数（与 `DiffDetector` 使用同一钳制范围）。

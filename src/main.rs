@@ -32,6 +32,7 @@ mod globals;
 mod gui;
 mod input;
 mod logger;
+mod privilege;
 mod protocol;
 mod rtc;
 mod server;
@@ -51,6 +52,7 @@ struct Args {
     password: Option<String>,
     open_browser: bool,
     verbose: bool,
+    no_elevate: bool,
     help: bool,
 }
 
@@ -63,6 +65,7 @@ fn parse_args() -> Args {
             "--no-gui" | "--headless" => a.headless = true,
             "--open-browser" => a.open_browser = true,
             "--verbose" | "-v" => a.verbose = true,
+            "--no-elevate" => a.no_elevate = true,
             "--help" | "-h" => a.help = true,
             "--port" => {
                 if let Some(v) = it.next() {
@@ -98,6 +101,7 @@ fn print_help() {
            --password <PWD>     临时指定访问密码（不写入配置文件）\n\
            --open-browser       服务启动后打开浏览器\n\
            --verbose            输出调试日志\n\
+           --no-elevate         不自动请求管理员权限（无法操作提权窗口）\n\
            -h, --help           显示帮助\n"
     );
 }
@@ -141,6 +145,25 @@ fn main() {
     globals::set_verbose(args.verbose);
     logger::init(Some(config::log_path()));
     log_info!("WebDesk 2.0.0 (Rust) 启动 | 日志: {}", logger::path_string());
+
+    // UIPI 会拦截低权限进程向高权限窗口（任务管理器等）注入输入。
+    // 默认自动请求管理员权限重启一次；用户拒绝 UAC 时降级运行并记录告警。
+    #[cfg(windows)]
+    if !args.no_elevate && !privilege::is_elevated() {
+        match privilege::relaunch_as_admin() {
+            Ok(()) => {
+                log_info!("已请求以管理员身份重启，当前进程退出");
+                return;
+            }
+            Err(e) => log_warn!(
+                "自动提权失败: {e}；将以当前权限继续运行，无法操作管理员窗口"
+            ),
+        }
+    }
+    #[cfg(windows)]
+    if privilege::is_elevated() {
+        log_info!("当前以管理员权限运行，可操作提权窗口");
+    }
 
     // 单实例：已有实例在运行时唤起它的主窗口，避免重复监听端口
     let _instance = match single_instance::acquire() {

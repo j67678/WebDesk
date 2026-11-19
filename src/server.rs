@@ -52,9 +52,9 @@ const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// 关键帧的最小间隔。客户端弱网自救会周期性请求 IDR，若不设下限，
 /// 每次 IDR 都会占满带宽并加剧丢包，形成“画面冻结 + 带宽饱和”的闭环。
 const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_secs(2);
-/// 静止恢复时的 IDR 限频。与上面的弱网自救分开：一次拖动只触发一次恢复，
-/// 用 2 秒门槛会让恢复后的首帧仍依赖可能已丢失的参考帧，表现为拖动初始卡顿。
-const RESUME_KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// 新观看者接入时强制立即发 IDR，不受 KEYFRAME_MIN_INTERVAL 限制：
+/// 否则后加入的客户端要等上一个 GOP 结束（最长 6 秒）才能出画面。
+const CONNECT_KEYFRAME_DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Mutex 被污染时不连锁 panic（否则一条连接的异常会毒死整个服务状态）。
 fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status> {
@@ -484,6 +484,8 @@ impl EncodedHub {
 #[derive(Default)]
 struct EncoderControl {
     keyframe: bool,
+    /// 新客户端接入：绕过 IDR 最小间隔，立即给出可解码的首帧。
+    force_keyframe: bool,
     bitrate_kbps: Option<u32>,
 }
 
@@ -491,7 +493,7 @@ struct EncoderControl {
 ///
 /// 按固定节拍捕获原始 BGRA 帧并广播给编码器；空闲（无观看者）时暂停以省电。
 fn spawn_capture_thread(
-    fps: u32,
+    capture_hz: u32,
     stop: Arc<AtomicBool>,
     viewers: Arc<AtomicUsize>,
     hub: Arc<FrameHub>,
@@ -507,9 +509,9 @@ fn spawn_capture_thread(
                     return;
                 }
             };
-            let interval = Duration::from_millis((1000 / fps.max(1)).max(1) as u64);
+            let interval = Duration::from_micros(1_000_000 / capture_hz.max(1) as u64);
             let (width, height) = capturer.size();
-            log_debug!("共享捕获线程启动 {width}x{height} @ {fps}fps");
+            log_debug!("共享捕获线程启动 {width}x{height} @ {capture_hz}Hz");
 
             let mut idle = false;
             let mut next_tick = std::time::Instant::now();
@@ -532,6 +534,7 @@ fn spawn_capture_thread(
                             width: frame.width,
                             height: frame.height,
                             data: frame.data.to_vec(),
+                            captured_at: Instant::now(),
                         });
                         hub.publish(shared);
                     }
@@ -596,7 +599,6 @@ fn spawn_encoder_thread(
             let mut last_source: Option<Arc<SharedFrame>> = None;
             let mut last_publish = Instant::now();
             let mut last_keyframe = Instant::now();
-            let mut skipped_since_publish = false;
 
             while !stop.load(Ordering::Relaxed) {
                 if viewers.load(Ordering::Relaxed) == 0 {
@@ -610,11 +612,13 @@ fn spawn_encoder_thread(
                 idle = false;
 
                 // 应用弱网反馈（来自客户端的 keyframe / adapt 消息）
-                let (want_keyframe, new_bitrate) = {
+                let (want_keyframe, force_keyframe, new_bitrate) = {
                     let mut c = control.lock().unwrap_or_else(|e| e.into_inner());
                     let k = c.keyframe;
+                    let f = c.force_keyframe;
                     c.keyframe = false;
-                    (k, c.bitrate_kbps.take())
+                    c.force_keyframe = false;
+                    (k, f, c.bitrate_kbps.take())
                 };
                 let bitrate_changed = new_bitrate.is_some();
                 if let Some(requested) = new_bitrate {
@@ -635,7 +639,9 @@ fn spawn_encoder_thread(
                 // 关键帧限频：忽略过密请求，避免 IDR 风暴把带宽打满。
                 // 被限流的请求不参与下方的“强制编码”判定。
                 let mut keyframe_granted = false;
-                if want_keyframe && last_keyframe.elapsed() >= KEYFRAME_MIN_INTERVAL {
+                if (force_keyframe || want_keyframe)
+                    && (force_keyframe || last_keyframe.elapsed() >= KEYFRAME_MIN_INTERVAL)
+                {
                     if let Some(enc) = encoder.as_mut() {
                         enc.request_keyframe();
                         last_keyframe = Instant::now();
@@ -665,18 +671,11 @@ fn spawn_encoder_thread(
                         .as_ref()
                         .map_or(true, |prev| prev.data.as_slice() != shared.data.as_slice());
                 if !changed && !keyframe_granted && !bitrate_changed && !refresh_due {
-                    skipped_since_publish = true;
                     continue;
                 }
-                // 静止后恢复变化时立即发 IDR，避免 P 帧参考丢失导致点击后等下一个 GOP。
-                if changed && skipped_since_publish
-                    && last_keyframe.elapsed() >= RESUME_KEYFRAME_MIN_INTERVAL
-                {
-                    if let Some(enc) = encoder.as_mut() {
-                        enc.request_keyframe();
-                        last_keyframe = Instant::now();
-                    }
-                }
+                // 静止恢复不再强制 IDR：1 秒保活帧已经让解码器持有最新参考帧，
+                // 直接用 P 帧恢复即可。1080p 一张 IDR 实测 56ms / 1.5MB，
+                // 每次开始拖动都发会让首帧多等数秒，反而是最明显的拖动延迟。
 
                 if encoder.is_none()
                     || encoder.as_ref().map(|e| {
@@ -714,14 +713,10 @@ fn spawn_encoder_thread(
                             generation,
                             data: Arc::new(data),
                             keyframe: is_keyframe,
+                            captured_at: shared.captured_at,
                         });
                         last_source = Some(shared.clone());
                         last_publish = Instant::now();
-                        // 保活帧不代表画面恢复，只有真实像素变化才清除“静止跳过”标记，
-                        // 否则拖动开始的第一帧拿不到 IDR。
-                        if changed {
-                            skipped_since_publish = false;
-                        }
                     }
                     Ok(_) => {}
                     Err(e) => log_warn!("H264 编码失败: {e}"),
@@ -841,7 +836,12 @@ async fn start_server(
         .with_state(state);
 
     // 全局唯一捕获线程 + 编码线程：全服务只编码一次，多客户端共享 H.264 帧
-    let capture_thread = spawn_capture_thread(cfg.fps, stop_flag.clone(), viewers.clone(), hub.clone());
+    // 捕获按两倍编码帧率轮询（上限 60Hz）：屏幕帧的到达相位相对捕获节拍是
+    // 随机的，30fps 捕获平均要多等约半个周期；高频捕获 + 编码器只取最新帧
+    // 能把这段延迟减半，而编码负载不变（FrameHub 只保留最新帧）。
+    let capture_hz = cfg.fps.saturating_mul(2).clamp(1, 60);
+    let capture_thread =
+        spawn_capture_thread(capture_hz, stop_flag.clone(), viewers.clone(), hub.clone());
     let encoder_thread = spawn_encoder_thread(
         cfg.fps,
         cfg.bitrate_kbps,
@@ -1114,6 +1114,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // 输入状态在连接结束时 Drop，会抬起本会话所有仍未松开的按键
     let mut input_state = InputState::new();
     let mut failures = 0u32;
+    // 初值回退一个去抖窗口，保证首次 ICE 连通必定拿到 IDR。
+    let mut last_connect_keyframe = Instant::now() - CONNECT_KEYFRAME_DEBOUNCE;
     let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1137,6 +1139,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     if matches!(st, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
                         log_warn!("WebRTC 连接状态异常: {st:?}");
                         break;
+                    }
+                    // ICE 真正连通后才请求 IDR：此时 RTP 通道已可用，首帧不会
+                    // 在连接建立前发出去而丢失；新观看者不必等整个 GOP 才有画面。
+                    if st == RTCPeerConnectionState::Connected
+                        && last_connect_keyframe.elapsed() >= CONNECT_KEYFRAME_DEBOUNCE
+                    {
+                        last_connect_keyframe = Instant::now();
+                        if let Ok(mut c) = state.encoder_control.lock() {
+                            c.force_keyframe = true;
+                        }
                     }
                 }
             }
@@ -1239,23 +1251,29 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 media_task = Some(tokio::spawn(async move {
                                     let mut written = 0u64;
                                     let mut last_log = Instant::now();
-                                    let mut last_write = Instant::now();
+                                    let mut last_captured: Option<Instant> = None;
                                     while frame_rx.changed().await.is_ok() {
                                         let frame = frame_rx.borrow_and_update().clone();
                                         let Some(frame) = frame else { continue };
                                         let data = (*frame.data).clone();
-                                        // RTP 时间戳按实际写帧间隔推进，并夹在 [0.5x, 2x] 标称帧间隔内：
-                                        // 固定用标称值时，编码慢于目标帧率会让 RTP 时钟持续慢于真实
-                                        // 时钟，抖动缓冲会越积越深；直接用未经限制的 elapsed 又会让
-                                        // 静态期累积的秒级间隔把点击后首帧顶到未来，导致数秒延迟。
-                                        let duration = last_write
-                                            .elapsed()
-                                            .clamp(interval / 2, interval * 2);
-                                        if let Err(e) = track_writer.write_h264(data, duration).await {
+                                        // RTP 时间戳按“捕获时刻”推进，而不是写 RTP 的时刻：
+                                        // 编码抖动的几十毫秒不会被接收端抖动缓冲累积成越来越深的
+                                        // 画面延迟；跳帧时时间戳也正确跨过，浏览器不会等不存在的帧。
+                                        // 夹在 [0.5x, 2x] 标称间隔，避免静态期秒级间隔顶飞首帧。
+                                        let duration = match last_captured {
+                                            Some(prev) => frame
+                                                .captured_at
+                                                .saturating_duration_since(prev)
+                                                .clamp(interval / 2, interval * 2),
+                                            None => interval,
+                                        };
+                                        last_captured = Some(frame.captured_at);
+                                        if let Err(e) =
+                                            track_writer.write_h264(data, duration, frame.captured_at).await
+                                        {
                                             log_warn!("WebRTC 写帧失败: {e}");
                                             break;
                                         }
-                                        last_write = Instant::now();
                                         written += 1;
                                         if last_log.elapsed() >= Duration::from_secs(5) {
                                             log_debug!("WebRTC 写帧 {written} 帧/5s");
@@ -1362,6 +1380,7 @@ mod tests {
             generation: 100,
             data: Arc::new(vec![1]),
             keyframe: true,
+            captured_at: Instant::now(),
         });
         let first = hub
             .wait_newer(0, Duration::from_millis(10))
@@ -1372,6 +1391,7 @@ mod tests {
             generation: 5000,
             data: Arc::new(vec![2]),
             keyframe: false,
+            captured_at: Instant::now(),
         });
         let second = hub
             .wait_newer(first.generation, Duration::from_millis(10))

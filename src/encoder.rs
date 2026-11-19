@@ -5,6 +5,7 @@
 //! - 支持 ABR 码率控制与运行时强制 IDR（客户端丢包时立即恢复）
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use rusty_h264_common::YuvPlanes;
 use rusty_h264_encoder::{Encoder, EncoderConfig};
@@ -16,6 +17,8 @@ pub struct EncodedFrame {
     pub data: Arc<Vec<u8>>,
     #[allow(dead_code)]
     pub keyframe: bool,
+    /// 原始帧的捕获时刻，供 RTP 时间戳使用。
+    pub captured_at: Instant,
 }
 
 /// H.264 编码器封装。内部复用 I420 平面缓冲，避免每帧分配整屏内存。
@@ -222,10 +225,13 @@ fn encoder_config(width: usize, height: usize, fps: u32, bitrate_kbps: u32) -> E
     cfg.framerate = fps.max(1) as f32;
     cfg.bitrate = bitrate_kbps.max(150) * 1000;
     cfg.qp = 26;
-    // 关键帧间隔约 2 秒：兼顾随机接入速度与压缩效率
-    cfg.gop_size = (fps * 2).max(15);
+    // 1080p 桌面单张 IDR 可达数百 KB（合成纹理实测 1.5MB / 56ms），
+    // 在 2.5Mbps 下发完一张要数秒——拖动一旦触发 IDR 就是明显卡顿。
+    // 因此保持 baseline 的零缓冲语义，关闭场景切换，并把 GOP 拉长到 6 秒；
+    // 新观看者接入与丢包恢复由服务端/客户端显式请求 IDR 兜底。
+    cfg.gop_size = (fps * 6).max(60);
     cfg.min_keyint = fps.max(1);
-    cfg.scenecut = 40;
+    cfg.scenecut = 0;
     cfg
 }
 
@@ -253,6 +259,49 @@ mod bench {
                 el.as_millis()
             );
         }
+    }
+
+    /// 拆分测量：像素转换 / 编码 / 场景切换开销 / IDR 体积。
+    /// 用带纹理的合成帧近似桌面内容（纯色帧是编码器的最乐观情况）。
+    #[test]
+    fn measure_latency_breakdown() {
+        let (w, h) = (1920usize, 1080usize);
+        let mut bgra = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let v = (((x >> 3) ^ (y >> 3)) * 37 + ((x * 7 + y * 3) & 0x3f)) as u8;
+                bgra[i] = v;
+                bgra[i + 1] = v ^ 0x55;
+                bgra[i + 2] = v.wrapping_mul(3);
+                bgra[i + 3] = 255;
+            }
+        }
+
+        let mut enc = VideoEncoder::new(w as u32, h as u32, 30, 2500).unwrap();
+        let n = 10;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            enc.bgra_to_i420(&bgra, w, h);
+        }
+        let convert_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        let t = std::time::Instant::now();
+        let mut p_size = 0usize;
+        for _ in 0..n {
+            p_size = enc.encode(&bgra, w as u32, h as u32).unwrap().len();
+        }
+        let encode_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        enc.request_keyframe();
+        let t = std::time::Instant::now();
+        let idr = enc.encode(&bgra, w as u32, h as u32).unwrap();
+        let idr_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!(
+            "BREAKDOWN 1920x1080: convert {:.1}ms, encode {:.1}ms, IDR {:.1}ms, P {}B, IDR {}B",
+            convert_ms, encode_ms, idr_ms, p_size, idr.len()
+        );
     }
 
     fn reference_convert(

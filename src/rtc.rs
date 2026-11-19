@@ -60,11 +60,17 @@ pub struct TrackWriter {
 
 impl TrackWriter {
     /// 把一帧 Annex-B H.264 写入 RTP 轨（库内部负责分片、序号、时间戳）。
-    pub async fn write_h264(&self, data: Vec<u8>, duration: Duration) -> Result<(), String> {
+    /// `captured_at` 传帧的真实捕获时刻，供绝对发送时间扩展使用。
+    pub async fn write_h264(
+        &self,
+        data: Vec<u8>,
+        duration: Duration,
+        captured_at: Instant,
+    ) -> Result<(), String> {
         let sample = Sample {
             data: Bytes::from(data),
             duration,
-            ..Sample::new(Instant::now())
+            ..Sample::new(captured_at)
         };
         self.track
             .sample_writer(self.ssrc, self.payload_type)

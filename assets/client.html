@@ -97,7 +97,8 @@
   body.fullscreen-mode #viewport { position: fixed; inset: 0; width: 100vw; height: 100vh; overflow: hidden; }
   #canvas-wrapper { position: relative; display: inline-block; flex-shrink: 0; margin: auto; cursor: none; touch-action: none; }
   #screen-video { display: block; background: #111; touch-action: none; object-fit: fill; }
-  #remote-cursor { position: absolute; width: 16px; height: 16px; pointer-events: none; z-index: 10; transform: translate(-2px,-2px); }
+  /* 用 transform 定位光标：只走合成层，不触发布局，拖动时不会强制同步重排 */
+  #remote-cursor { position: absolute; left: 0; top: 0; width: 16px; height: 16px; pointer-events: none; z-index: 10; transform: translate3d(-2px,-2px,0); will-change: transform; contain: layout style paint; }
 
   #overlay {
     position: absolute; inset: 0; display: flex; flex-direction: column;
@@ -615,12 +616,22 @@ let lastRcvLost = 0, lastRcvReceived = 0;
 let lastDecodedFrames = 0, decodedStallAt = 0, stallKeyframeAttempts = 0;
 
 // ── 缩放 / 坐标 ────────────────────────────────────────────────────
+// 布局矩形缓存：pointermove 每秒可触发上百次，反复读 getBoundingClientRect
+// 会在刚写过光标样式后强制同步重排。只在缩放/滚动/窗口变化时失效。
+let videoRect = null;
+function invalidateVideoRect() { videoRect = null; }
+function getVideoRect() {
+  if (!videoRect) videoRect = video.getBoundingClientRect();
+  return videoRect;
+}
 function applyZoom(z) {
   zoom = Math.max(0.1, Math.min(6, z));
   video.style.width = (remoteWidth * zoom) + 'px';
   video.style.height = (remoteHeight * zoom) + 'px';
-  remoteCursor.style.width = (16 * Math.min(zoom, 2)) + 'px';
-  remoteCursor.style.height = (16 * Math.min(zoom, 2)) + 'px';
+  const cs = 16 * Math.min(zoom, 2);
+  remoteCursor.style.width = cs + 'px';
+  remoteCursor.style.height = cs + 'px';
+  invalidateVideoRect();
 }
 function fitToWindow() {
   manualZoom = false;
@@ -629,16 +640,16 @@ function fitToWindow() {
   applyZoom(Math.min(vw / remoteWidth, vh / remoteHeight));
 }
 function toRemote(clientX, clientY) {
-  const r = video.getBoundingClientRect();
+  const r = getVideoRect();
   return {
     x: Math.max(0, Math.min(remoteWidth - 1, Math.round((clientX - r.left) * remoteWidth / r.width))),
     y: Math.max(0, Math.min(remoteHeight - 1, Math.round((clientY - r.top) * remoteHeight / r.height)))
   };
 }
 function updateCursor(cx, cy) {
-  const r = video.getBoundingClientRect();
-  remoteCursor.style.left = (cx - r.left) + 'px';
-  remoteCursor.style.top = (cy - r.top) + 'px';
+  const r = getVideoRect();
+  remoteCursor.style.transform =
+    'translate3d(' + (cx - r.left).toFixed(1) + 'px,' + (cy - r.top).toFixed(1) + 'px,0) translate(-2px,-2px)';
 }
 // 点击 / 滚轮前把尚未发出的移动立即补发，避免在旧位置触发操作
 function flushMove() {
@@ -652,16 +663,16 @@ wrapper.addEventListener('pointerdown', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
   e.preventDefault();
   flushMove();
-  updateCursor(e.clientX, e.clientY);
   const p = toRemote(e.clientX, e.clientY);
+  updateCursor(e.clientX, e.clientY);
   send({ type: 'mousedown', x: p.x, y: p.y, button: e.button });
   pressedButtons.add(e.button);
   wrapper.setPointerCapture(e.pointerId);
 });
 wrapper.addEventListener('pointermove', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
-  updateCursor(e.clientX, e.clientY);
   const p = toRemote(e.clientX, e.clientY);
+  updateCursor(e.clientX, e.clientY);
   if (pressedButtons.size > 0) {
     // 按住拖动窗口时每一条 pointermove 立即发出：等 rAF 会额外引入一帧
     // （解码繁忙时可达 30ms+）延迟，且此时事件本身已被浏览器合并过。
@@ -772,7 +783,7 @@ wrapper.addEventListener('touchmove', e => {
       T.moved = true; clearLongPress();
     }
     const now = performance.now();
-    if (now - lastMoveSent < 8) return;       // 拖动节流放宽到 8ms，跟手优先
+    if (now - lastMoveSent < 4) return;       // 拖动节流收紧到 4ms，跟手优先
     lastMoveSent = now;
     const p = toRemote(t.clientX, t.clientY);
     send({ type: 'mousemove', x: p.x, y: p.y, button: T.dragDown ? 0 : 0 });
@@ -966,8 +977,9 @@ $('auth-submit').addEventListener('click', submitAuth);
 $('auth-cancel').addEventListener('click', () => { authDialog.classList.remove('show'); disconnect(); });
 authPassword.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitAuth(); } });
 
-window.addEventListener('resize', () => { if (!manualZoom) fitToWindow(); });
-window.addEventListener('orientationchange', () => setTimeout(() => { if (!manualZoom) fitToWindow(); }, 250));
+viewport.addEventListener('scroll', invalidateVideoRect, { passive: true });
+window.addEventListener('resize', () => { invalidateVideoRect(); if (!manualZoom) fitToWindow(); });
+window.addEventListener('orientationchange', () => setTimeout(() => { invalidateVideoRect(); if (!manualZoom) fitToWindow(); }, 250));
 
 video.width = 1920; video.height = 1080;
 
