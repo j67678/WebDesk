@@ -675,18 +675,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             let t0 = std::time::Instant::now();
             match capturer.capture() {
                 Ok(frame) => {
-                    let tiles = detector.diff(&frame);
-                    if !tiles.is_empty() {
-                        let encoded: Vec<_> = tiles
+                    detector.diff(&frame);
+                    if !detector.changed().is_empty() {
+                        // 瓦片槽位与 RGB 缓冲由 detector 复用，这里只读取
+                        let encoded: Vec<_> = detector
+                            .changed()
                             .iter()
-                            .filter_map(|t| match encode_jpeg(t, quality) {
-                                Ok(jpeg) => Some(json!({
-                                    "x": t.x, "y": t.y, "w": t.w, "h": t.h,
-                                    "data": B64.encode(jpeg), "fmt": "jpeg"
-                                })),
-                                Err(e) => {
-                                    log_warn!("JPEG 编码失败: {e}");
-                                    None
+                            .filter_map(|&idx| {
+                                let t = detector.tile(idx);
+                                match encode_jpeg(t, quality) {
+                                    Ok(jpeg) => Some(json!({
+                                        "x": t.x, "y": t.y, "w": t.w, "h": t.h,
+                                        "data": B64.encode(jpeg), "fmt": "jpeg"
+                                    })),
+                                    Err(e) => {
+                                        log_warn!("JPEG 编码失败: {e}");
+                                        None
+                                    }
                                 }
                             })
                             .collect();

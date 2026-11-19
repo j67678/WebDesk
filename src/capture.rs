@@ -1,16 +1,19 @@
 //! 屏幕捕获、瓦片差分与 JPEG 编码。
 //!
-//! Windows 使用 GDI BitBlt + GetDIBits 抓取虚拟桌面（支持多显示器），
-//! 输出自上而下的 32 位 BGRA；差分按瓦片做容差哈希，只编码变化的区域。
+//! Windows 使用 CreateDIBSection + BitBlt 把虚拟桌面直接画进 BGRA 缓冲（支持多显示器），
+//! 捕获资源与像素缓冲跨帧复用，不再每帧重建 GDI 对象或复制整屏；
+//! 差分按瓦片做容差哈希，只编码变化的区域，瓦片 RGB 缓冲同样跨帧复用。
 
 use std::io::{self, Cursor};
 
 /// 一帧原始画面：BGRA、top-down。
-#[derive(Clone)]
-pub struct Frame {
+///
+/// 像素数据由 `ScreenCapturer` 持有，帧本身只借用，避免每帧复制整屏缓冲。
+#[derive(Clone, Copy)]
+pub struct Frame<'a> {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
 }
 
 pub struct Tile {
@@ -18,8 +21,20 @@ pub struct Tile {
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// 已转换为 RGB8，可直接送 JPEG 编码器
+    /// 已转换为 RGB8，可直接送 JPEG 编码器（缓冲跨帧复用）
     pub rgb: Vec<u8>,
+}
+
+impl Tile {
+    fn empty() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+            rgb: Vec::new(),
+        }
+    }
 }
 
 pub use imp::{virtual_screen_origin, ScreenCapturer};
@@ -31,6 +46,10 @@ pub struct DiffDetector {
     cols: usize,
     rows: usize,
     initialized: bool,
+    /// 与网格一一对应的瓦片槽位；rgb 缓冲只在分辨率变化时重新分配
+    tiles: Vec<Tile>,
+    /// 本帧变化瓦片的下标（按扫描顺序）
+    changed: Vec<usize>,
 }
 
 impl DiffDetector {
@@ -41,6 +60,8 @@ impl DiffDetector {
             cols: 0,
             rows: 0,
             initialized: false,
+            tiles: Vec::new(),
+            changed: Vec::new(),
         }
     }
 
@@ -49,8 +70,9 @@ impl DiffDetector {
         self.prev.clear();
     }
 
-    /// 返回本帧发生变化的瓦片（首帧或尺寸变化时返回全部瓦片）。
-    pub fn diff(&mut self, frame: &Frame) -> Vec<Tile> {
+    /// 计算本帧变化的瓦片：结果保存在内部槽位，通过 `changed()` 取下标、
+    /// `tile()` 取瓦片；首帧或尺寸变化时全部瓦片都视为变化。
+    pub fn diff(&mut self, frame: &Frame<'_>) {
         let ts = self.tile_size;
         let cols = (frame.width as usize + ts as usize - 1) / ts as usize;
         let rows = (frame.height as usize + ts as usize - 1) / ts as usize;
@@ -58,11 +80,17 @@ impl DiffDetector {
         self.cols = cols;
         self.rows = rows;
         self.initialized = true;
-        if self.prev.len() != cols * rows {
-            self.prev.resize(cols * rows, 0);
-        }
 
-        let mut out = Vec::new();
+        let slots = cols * rows;
+        if self.prev.len() != slots {
+            self.prev.resize(slots, 0);
+        }
+        if self.tiles.len() != slots {
+            self.tiles.clear();
+            self.tiles.resize_with(slots, Tile::empty);
+        }
+        self.changed.clear();
+
         for row in 0..rows {
             for col in 0..cols {
                 let idx = row * cols + col;
@@ -74,16 +102,31 @@ impl DiffDetector {
                 let changed = full || hash != self.prev[idx];
                 self.prev[idx] = hash;
                 if changed {
-                    out.push(extract_rgb(frame, x, y, w, h));
+                    let slot = &mut self.tiles[idx];
+                    slot.x = x;
+                    slot.y = y;
+                    slot.w = w;
+                    slot.h = h;
+                    fill_rgb(frame, slot);
+                    self.changed.push(idx);
                 }
             }
         }
-        out
+    }
+
+    /// 本帧变化瓦片的下标。
+    pub fn changed(&self) -> &[usize] {
+        &self.changed
+    }
+
+    /// 按下标读取瓦片（坐标与 RGB 数据）。
+    pub fn tile(&self, idx: usize) -> &Tile {
+        &self.tiles[idx]
     }
 }
 
 /// 容差哈希：每通道丢弃低 2 位（等价于约 3 级色差阈值），抑制压缩/光标噪声。
-fn tile_hash(frame: &Frame, x: u32, y: u32, w: u32, h: u32) -> u64 {
+fn tile_hash(frame: &Frame<'_>, x: u32, y: u32, w: u32, h: u32) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let stride = frame.width as usize * 4;
     let mut ry = y as usize;
@@ -105,20 +148,25 @@ fn tile_hash(frame: &Frame, x: u32, y: u32, w: u32, h: u32) -> u64 {
     hash
 }
 
-fn extract_rgb(frame: &Frame, x: u32, y: u32, w: u32, h: u32) -> Tile {
-    let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
+/// 把瓦片的 BGRA 像素转换进已复用的 RGB 缓冲，避免逐帧分配。
+fn fill_rgb(frame: &Frame<'_>, tile: &mut Tile) {
+    let w = tile.w as usize;
+    let h = tile.h as usize;
     let stride = frame.width as usize * 4;
-    for row in y..(y + h) {
-        let base = row as usize * stride + x as usize * 4;
-        for col in 0..w as usize {
-            let i = base + col * 4;
-            // GetDIBits 输出 BGRA
-            rgb.push(frame.data[i + 2]);
-            rgb.push(frame.data[i + 1]);
-            rgb.push(frame.data[i]);
+    let row_bytes = w * 3;
+    tile.rgb.resize(row_bytes * h, 0);
+
+    for row in 0..h {
+        let src_start = (tile.y as usize + row) * stride + tile.x as usize * 4;
+        // GetDIBits / DIB 均为 BGRA
+        let src = &frame.data[src_start..src_start + w * 4];
+        let dst = &mut tile.rgb[row * row_bytes..(row + 1) * row_bytes];
+        for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(3)) {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
         }
     }
-    Tile { x, y, w, h, rgb }
 }
 
 pub fn encode_jpeg(tile: &Tile, quality: u8) -> io::Result<Vec<u8>> {
@@ -142,14 +190,14 @@ pub fn encode_jpeg(tile: &Tile, quality: u8) -> io::Result<Vec<u8>> {
 #[cfg(windows)]
 mod imp {
     use super::Frame;
+    use std::ffi::c_void;
     use std::io;
     use std::mem::{size_of, zeroed};
     use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT,
-        DIB_RGB_COLORS, SRCCOPY,
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC,
+        HGDIOBJ, SRCCOPY,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
@@ -175,113 +223,154 @@ mod imp {
         }
     }
 
+    /// 复用同一块 DIB Section：BitBlt 直接写入像素内存，无需每帧 GetDIBits 转换。
     pub struct ScreenCapturer {
-        buffer: Vec<u8>,
         width: u32,
         height: u32,
+        screen_dc: HDC,
+        mem_dc: HDC,
+        bitmap: HBITMAP,
+        old: HGDIOBJ,
+        bits: *mut u8,
+        bits_len: usize,
     }
 
     impl ScreenCapturer {
         pub fn new() -> io::Result<Self> {
             let (w, h) = virtual_screen_size();
-            Ok(Self {
-                buffer: vec![0u8; w as usize * h as usize * 4],
+            let mut capturer = Self {
                 width: w,
                 height: h,
-            })
+                screen_dc: null_mut(),
+                mem_dc: null_mut(),
+                bitmap: null_mut(),
+                old: null_mut(),
+                bits: null_mut(),
+                bits_len: 0,
+            };
+            capturer.init()?;
+            Ok(capturer)
         }
 
         pub fn size(&self) -> (u32, u32) {
             (self.width, self.height)
         }
 
-        pub fn capture(&mut self) -> io::Result<Frame> {
+        /// 按当前分辨率建立 DC / DIB Section，之后跨帧复用。
+        fn init(&mut self) -> io::Result<()> {
+            self.release();
             unsafe {
-                let (ox, oy) = virtual_screen_origin();
-                let (w, h) = virtual_screen_size();
-                if (w, h) != (self.width, self.height) {
-                    self.width = w;
-                    self.height = h;
-                    self.buffer.resize(w as usize * h as usize * 4, 0);
-                }
-
-                let hwnd: HWND = null_mut();
-                let screen_dc = GetDC(hwnd);
+                let screen_dc = GetDC(null_mut());
                 if screen_dc.is_null() {
                     return Err(io::Error::last_os_error());
                 }
                 let mem_dc = CreateCompatibleDC(screen_dc);
-                let bitmap = CreateCompatibleBitmap(screen_dc, w as i32, h as i32);
-                if mem_dc.is_null() || bitmap.is_null() {
-                    if !bitmap.is_null() {
-                        DeleteObject(bitmap);
-                    }
-                    if !mem_dc.is_null() {
-                        DeleteDC(mem_dc);
-                    }
-                    ReleaseDC(hwnd, screen_dc);
-                    return Err(io::Error::new(io::ErrorKind::Other, "无法创建兼容 DC / Bitmap"));
-                }
-
-                let old = SelectObject(mem_dc, bitmap);
-                let ok = BitBlt(
-                    mem_dc,
-                    0,
-                    0,
-                    w as i32,
-                    h as i32,
-                    screen_dc,
-                    ox,
-                    oy,
-                    SRCCOPY | CAPTUREBLT,
-                );
-                if ok == 0 {
-                    cleanup(screen_dc, mem_dc, bitmap, old);
+                if mem_dc.is_null() {
+                    ReleaseDC(null_mut(), screen_dc);
                     return Err(io::Error::last_os_error());
                 }
 
                 let mut bmi: BITMAPINFO = zeroed();
                 bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-                bmi.bmiHeader.biWidth = w as i32;
-                bmi.bmiHeader.biHeight = -(h as i32); // 负数 = 自上而下
+                bmi.bmiHeader.biWidth = self.width as i32;
+                bmi.bmiHeader.biHeight = -(self.height as i32); // 负数 = 自上而下
                 bmi.bmiHeader.biPlanes = 1;
                 bmi.bmiHeader.biBitCount = 32;
                 bmi.bmiHeader.biCompression = 0; // BI_RGB
-                let lines = GetDIBits(
-                    mem_dc,
-                    bitmap,
-                    0,
-                    h,
-                    self.buffer.as_mut_ptr().cast(),
-                    &mut bmi,
+
+                let mut bits: *mut c_void = null_mut();
+                let bitmap = CreateDIBSection(
+                    screen_dc,
+                    &bmi,
                     DIB_RGB_COLORS,
+                    &mut bits,
+                    null_mut(),
+                    0,
                 );
-                cleanup(screen_dc, mem_dc, bitmap, old);
-                if lines == 0 {
-                    return Err(io::Error::new(io::ErrorKind::Other, "GetDIBits 失败"));
+                if bitmap.is_null() || bits.is_null() {
+                    if !bitmap.is_null() {
+                        DeleteObject(bitmap);
+                    }
+                    DeleteDC(mem_dc);
+                    ReleaseDC(null_mut(), screen_dc);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "无法创建 DIB Section",
+                    ));
+                }
+                let old = SelectObject(mem_dc, bitmap);
+
+                self.screen_dc = screen_dc;
+                self.mem_dc = mem_dc;
+                self.bitmap = bitmap;
+                self.old = old;
+                self.bits = bits as *mut u8;
+                self.bits_len = self.width as usize * self.height as usize * 4;
+            }
+            Ok(())
+        }
+
+        pub fn capture(&mut self) -> io::Result<Frame<'_>> {
+            unsafe {
+                let (w, h) = virtual_screen_size();
+                if (w, h) != (self.width, self.height) {
+                    self.width = w;
+                    self.height = h;
+                    self.init()?;
+                }
+                let (ox, oy) = virtual_screen_origin();
+                let ok = BitBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    self.screen_dc,
+                    ox,
+                    oy,
+                    SRCCOPY | CAPTUREBLT,
+                );
+                if ok == 0 {
+                    return Err(io::Error::last_os_error());
                 }
 
+                let data = std::slice::from_raw_parts(self.bits, self.bits_len);
                 Ok(Frame {
                     width: w,
                     height: h,
-                    data: self.buffer.clone(),
+                    data,
                 })
             }
         }
+
+        fn release(&mut self) {
+            unsafe {
+                if !self.mem_dc.is_null() {
+                    if !self.old.is_null() {
+                        SelectObject(self.mem_dc, self.old);
+                    }
+                    if !self.bitmap.is_null() {
+                        DeleteObject(self.bitmap);
+                    }
+                    DeleteDC(self.mem_dc);
+                }
+                if !self.screen_dc.is_null() {
+                    ReleaseDC(null_mut(), self.screen_dc);
+                }
+            }
+            self.screen_dc = null_mut();
+            self.mem_dc = null_mut();
+            self.bitmap = null_mut();
+            self.old = null_mut();
+            self.bits = null_mut();
+            self.bits_len = 0;
+        }
     }
 
-    unsafe fn cleanup(
-        screen_dc: windows_sys::Win32::Graphics::Gdi::HDC,
-        mem_dc: windows_sys::Win32::Graphics::Gdi::HDC,
-        bitmap: windows_sys::Win32::Graphics::Gdi::HBITMAP,
-        old: windows_sys::Win32::Graphics::Gdi::HGDIOBJ,
-    ) {
-        if !old.is_null() {
-            SelectObject(mem_dc, old);
+    impl Drop for ScreenCapturer {
+        fn drop(&mut self) {
+            self.release();
         }
-        DeleteObject(bitmap);
-        DeleteDC(mem_dc);
-        ReleaseDC(null_mut(), screen_dc);
     }
 }
 
@@ -311,7 +400,7 @@ mod imp {
             (0, 0)
         }
         #[allow(unused_variables)]
-        pub fn capture(&mut self) -> io::Result<Frame> {
+        pub fn capture(&mut self) -> io::Result<Frame<'_>> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "当前平台暂不支持屏幕捕获",
