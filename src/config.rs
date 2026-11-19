@@ -32,6 +32,10 @@ pub struct Config {
     pub fps: u32,
     pub tile_size: u32,
     pub quality: u8,
+    /// H.264 目标码率（kbps），弱网下客户端可请求下调
+    pub bitrate_kbps: u32,
+    /// 弱网自适应码率下限（kbps）；低于此值桌面字体明显模糊，服务端强制不下探
+    pub min_bitrate_kbps: u32,
     pub autostart: bool,
     pub minimize_to_tray: bool,
     pub start_minimized: bool,
@@ -46,6 +50,8 @@ impl Default for Config {
             fps: 15,
             tile_size: 64,
             quality: 75,
+            bitrate_kbps: 2500,
+            min_bitrate_kbps: 1500,
             autostart: false,
             minimize_to_tray: true,
             start_minimized: false,
@@ -61,15 +67,19 @@ impl Config {
     /// 这些键改动需要重启监听；其余（密码等）可热更新。
     pub fn needs_restart(&self, other: &Config) -> bool {
         self.port != other.port
-            || self.fps != other.fps
+            ||         self.fps != other.fps
             || self.tile_size != other.tile_size
             || self.quality != other.quality
+            || self.bitrate_kbps != other.bitrate_kbps
+            || self.min_bitrate_kbps != other.min_bitrate_kbps
     }
 
     pub fn clamped(mut self) -> Self {
         self.fps = self.fps.clamp(1, 60);
         self.tile_size = self.tile_size.clamp(16, 256);
         self.quality = self.quality.clamp(10, 95);
+        self.min_bitrate_kbps = self.min_bitrate_kbps.clamp(300, 20_000);
+        self.bitrate_kbps = self.bitrate_kbps.clamp(self.min_bitrate_kbps, 20_000);
         self
     }
 
@@ -98,6 +108,12 @@ impl Config {
                 ("performance", "fps") => c.fps = val.parse().unwrap_or(c.fps),
                 ("performance", "tile_size") => c.tile_size = val.parse().unwrap_or(c.tile_size),
                 ("performance", "quality") => c.quality = val.parse().unwrap_or(c.quality),
+                ("performance", "bitrate_kbps") => {
+                    c.bitrate_kbps = val.parse().unwrap_or(c.bitrate_kbps)
+                }
+                ("performance", "min_bitrate_kbps") => {
+                    c.min_bitrate_kbps = val.parse().unwrap_or(c.min_bitrate_kbps)
+                }
                 ("general", "autostart") => c.autostart = parse_bool(&val, c.autostart),
                 ("general", "minimize_to_tray") => {
                     c.minimize_to_tray = parse_bool(&val, c.minimize_to_tray)
@@ -136,6 +152,10 @@ impl Config {
              fps = {fps}\n\
              tile_size = {tile}\n\
              quality = {quality}\n\
+             # H.264 目标码率 kbps（弱网会自动下调，300-20000）\n\
+             bitrate_kbps = {bitrate}\n\
+             # 弱网码率下限 kbps；过低会导致字体模糊，服务端强制不下探\n\
+             min_bitrate_kbps = {min_bitrate}\n\
              \n\
              [general]\n\
              # 开机自动启动\n\
@@ -150,6 +170,8 @@ impl Config {
             fps = self.fps,
             tile = self.tile_size,
             quality = self.quality,
+            bitrate = self.bitrate_kbps,
+            min_bitrate = self.min_bitrate_kbps,
             autostart = b(self.autostart),
             tray = b(self.minimize_to_tray),
             startmin = b(self.start_minimized),

@@ -26,12 +26,14 @@ fn attach_console_if_needed() {}
 
 mod capture;
 mod config;
+mod encoder;
 mod firewall;
 mod globals;
 mod gui;
 mod input;
 mod logger;
 mod protocol;
+mod rtc;
 mod server;
 mod single_instance;
 mod tray;

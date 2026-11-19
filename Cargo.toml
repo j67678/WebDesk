@@ -25,6 +25,16 @@ rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 eframe = "0.29"
 
+# WebRTC (IP 直连：仅 host candidate，无 STUN/TURN)
+webrtc = "0.21"
+rtc = "0.21"
+async-trait = "0.1"
+bytes = "1"
+
+# 纯 Rust H.264 编码器：Annex-B 输出、ABR 码控、支持强制 IDR（PLI/FIR 用）
+rusty_h264-encoder = "0.17"
+rusty_h264-common = "0.17"
+
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 tray-icon = "0.19"
 

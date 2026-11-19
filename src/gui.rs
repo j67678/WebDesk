@@ -512,18 +512,30 @@ impl WebDeskApp {
         ui.heading("画面与性能");
         ui.add_space(8.0);
         ui.add(egui::Slider::new(&mut self.cfg.fps, 1..=60).text("最大帧率 FPS"));
-        ui.label(RichText::new("局域网建议 20-30，广域网建议 10-15").color(Color32::GRAY));
+        ui.label(RichText::new("局域网建议 20-30，弱网建议 10-15").color(Color32::GRAY));
         ui.add_space(8.0);
-        ui.add(egui::Slider::new(&mut self.cfg.tile_size, 16..=256).text("差分瓦片大小（像素）"));
-        ui.label(RichText::new("越小越精细，但编码开销越大；推荐 64").color(Color32::GRAY));
+        ui.add(
+            egui::Slider::new(&mut self.cfg.bitrate_kbps, 300..=20_000)
+                .text("H.264 目标码率 (kbps)"),
+        );
+        ui.label(
+            RichText::new("越高画质越好、带宽占用越大；客户端弱网时会自动请求下调")
+                .color(Color32::GRAY),
+        );
         ui.add_space(8.0);
-        ui.add(egui::Slider::new(&mut self.cfg.quality, 10..=95).text("JPEG 压缩质量"));
-        ui.label(RichText::new("越高画质越好、带宽占用越大；推荐 75").color(Color32::GRAY));
+        ui.add(
+            egui::Slider::new(&mut self.cfg.min_bitrate_kbps, 300..=20_000)
+                .text("弱网码率下限 (kbps)"),
+        );
+        ui.label(
+            RichText::new("建议 1080p 不低于 1500；过低会导致远程桌面字体模糊。服务端强制不下探，弱网时优先掉帧保清晰。")
+                .color(Color32::GRAY),
+        );
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(6.0);
-        ui.label("传输方式：仅发送发生变化的瓦片（容差哈希），JPEG 编码后经 WebSocket 下发。");
-        ui.label("画面为 HTTP 明文传输（ws://），请勿在不可信网络中承载敏感内容。");
+        ui.label("传输方式：H.264 编码 + WebRTC RTP，仅 host candidate 直连（无 STUN/TURN）。");
+        ui.label("信令与输入走 WebSocket，画面经 SRTP 加密传输；请仅在可信网络中使用。");
     }
 
     fn general_tab(&mut self, ui: &mut egui::Ui) {

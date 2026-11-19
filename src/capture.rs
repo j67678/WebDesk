@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! 屏幕捕获、瓦片差分与 JPEG 编码。
 //!
 //! Windows 使用 CreateDIBSection + BitBlt 把虚拟桌面直接画进 BGRA 缓冲（支持多显示器），
@@ -34,9 +35,6 @@ pub use imp::{virtual_screen_origin, virtual_screen_size, ScreenCapturer};
 pub struct SharedFrame {
     pub width: u32,
     pub height: u32,
-    pub cols: usize,
-    pub rows: usize,
-    pub hashes: Vec<u64>,
     pub data: Vec<u8>,
 }
 
