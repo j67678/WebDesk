@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Request, State};
@@ -46,6 +46,11 @@ const KEY_STICKY_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_TICK: Duration = Duration::from_secs(2);
 /// 出站帧队列容量。有界队列 + 丢弃策略，避免慢客户端拖垮内存。
 const OUT_QUEUE_CAP: usize = 8;
+/// 画面静止时的保活刷新间隔：避免完全停流导致解码器误判卡死，
+/// 同时把静态带宽从满码率降到接近 0。
+const STATIC_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// 单帧 RTP 时间跨度上限，防止长时间静止后播放时间轴跳变。
+const MAX_SAMPLE_DURATION: Duration = Duration::from_millis(2200);
 
 /// Mutex 被污染时不连锁 panic（否则一条连接的异常会毒死整个服务状态）。
 fn lock_status(status: &Arc<Mutex<Status>>) -> std::sync::MutexGuard<'_, Status> {
@@ -584,8 +589,12 @@ fn spawn_encoder_thread(
             let mut encoder: Option<VideoEncoder> = None;
             let mut last_gen = 0u64;
             let mut idle = false;
-            let mut last_log = std::time::Instant::now();
+            let mut last_log = Instant::now();
             let mut encoded_bytes = 0usize;
+            // 静态画面跳过编码：仅按固定间隔发一帧保活，像素变化才恢复满帧率。
+            let mut last_source: Option<Arc<SharedFrame>> = None;
+            let mut last_publish = Instant::now();
+            let mut skipped_since_publish = false;
 
             while !stop.load(Ordering::Relaxed) {
                 if viewers.load(Ordering::Relaxed) == 0 {
@@ -605,6 +614,7 @@ fn spawn_encoder_thread(
                     c.keyframe = false;
                     (k, c.bitrate_kbps.take())
                 };
+                let bitrate_changed = new_bitrate.is_some();
                 if let Some(requested) = new_bitrate {
                     // 服务端权威下限：即使客户端上报异常低值也绝不突破清晰度底线
                     let kbps = requested.clamp(min_bitrate_kbps, bitrate_kbps);
@@ -632,6 +642,23 @@ fn spawn_encoder_thread(
                     continue;
                 };
                 last_gen = generation;
+
+                // 核心修复：画面像素未变化时不再编码/发送，避免 ABR 把静态桌面
+                // 也按目标码率灌满移动网络；仅按 STATIC_REFRESH_INTERVAL 发保活帧。
+                let changed = last_source
+                    .as_ref()
+                    .map_or(true, |prev| prev.data.as_slice() != shared.data.as_slice());
+                let refresh_due = last_publish.elapsed() >= STATIC_REFRESH_INTERVAL;
+                if !changed && !want_keyframe && !bitrate_changed && !refresh_due {
+                    skipped_since_publish = true;
+                    continue;
+                }
+                // 静止后恢复变化时立即发 IDR，避免 P 帧参考丢失导致点击后等下一个 GOP。
+                if changed && skipped_since_publish {
+                    if let Some(enc) = encoder.as_mut() {
+                        enc.request_keyframe();
+                    }
+                }
 
                 if encoder.is_none()
                     || encoder.as_ref().map(|e| {
@@ -667,6 +694,9 @@ fn spawn_encoder_thread(
                             data: Arc::new(data),
                             keyframe: is_keyframe,
                         });
+                        last_source = Some(shared.clone());
+                        last_publish = Instant::now();
+                        skipped_since_publish = false;
                     }
                     Ok(_) => {}
                     Err(e) => log_warn!("H264 编码失败: {e}"),
@@ -676,7 +706,7 @@ fn spawn_encoder_thread(
                     let kbps = encoded_bytes as f64 * 8.0 / last_log.elapsed().as_secs_f64() / 1000.0;
                     log_debug!("H264 输出码率约 {:.0} kbps", kbps);
                     encoded_bytes = 0;
-                    last_log = std::time::Instant::now();
+                    last_log = Instant::now();
                 }
             }
             encoded_hub.close();
@@ -1181,12 +1211,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     }
                                 });
                                 let interval = state.frame_interval;
+                                let max_duration = MAX_SAMPLE_DURATION.max(interval);
                                 media_task = Some(tokio::spawn(async move {
                                     let mut written = 0u64;
-                                    let mut last_log = std::time::Instant::now();
+                                    let mut last_log = Instant::now();
+                                    let mut last_write = Instant::now();
                                     while let Some(frame) = frame_rx.recv().await {
                                         let data = (*frame.data).clone();
-                                        if let Err(e) = track_writer.write_h264(data, interval).await {
+                                        // 静态跳帧后按真实间隔推进 RTP 时间戳，避免播放时间轴变慢。
+                                        let duration = last_write.elapsed().clamp(interval, max_duration);
+                                        last_write = Instant::now();
+                                        if let Err(e) = track_writer.write_h264(data, duration).await {
                                             log_warn!("WebRTC 写帧失败: {e}");
                                             break;
                                         }
@@ -1194,7 +1229,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         if last_log.elapsed() >= Duration::from_secs(5) {
                                             log_debug!("WebRTC 写帧 {written} 帧/5s");
                                             written = 0;
-                                            last_log = std::time::Instant::now();
+                                            last_log = Instant::now();
                                         }
                                     }
                                 }));
@@ -1242,7 +1277,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         if require_auth_ok!() {
                             input_state.sync_pressed(&msg);
                         }
-                        let _ = send_text(&tx, json!({"type":"pong"}).to_string()).await;
+                        // pong 只用于延迟显示；队列满时直接丢弃，不能让它阻塞输入处理。
+                        let _ = tx.try_send(OutMsg::Text(json!({"type":"pong"}).to_string()));
                     }
                     "sync_keys" | "release_all" => {
                         if require_auth_ok!() {

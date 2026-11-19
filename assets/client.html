@@ -570,13 +570,18 @@ async function collectRtcStats() {
           lastRcvLost = lost; lastRcvReceived = received; lastAdaptAt = now;
           const lossRate = lostDelta / Math.max(1, lostDelta + rcvDelta);
           let next = targetBitrateKbps;
+          let shouldKeyframe = false;
           if (lossRate > 0.05) {
-            next = Math.max(minBitrateKbps, Math.round(targetBitrateKbps * 0.75));
-            requestKeyframe();
+            if (targetBitrateKbps > minBitrateKbps) {
+              next = Math.max(minBitrateKbps, Math.round(targetBitrateKbps * 0.75));
+              // 只在真正降档时请求 IDR；已在下限时反复请求会放大拥塞。
+              shouldKeyframe = true;
+            }
           } else if (lossRate < 0.01) {
             next = Math.min(maxBitrateKbps, Math.round(targetBitrateKbps * 1.15));
           }
           bitrateAtFloor = next <= minBitrateKbps && lossRate > 0.05;
+          if (shouldKeyframe) requestKeyframe();
           if (next !== targetBitrateKbps) {
             targetBitrateKbps = next;
             send({ type: 'adapt', bitrate_kbps: next });
