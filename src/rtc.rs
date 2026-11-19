@@ -115,12 +115,15 @@ pub async fn establish(offer_sdp: String) -> Result<(RtcSession, String), String
         state_tx,
     });
 
+    // 双栈通配绑定：webrtc-rs 会把 0.0.0.0 / [::] 展开为本机各可用接口的真实
+    // host candidate（跳过 loopback/link-local）。只绑 IPv4 时纯 IPv6 客户端没有
+    // 同族 candidate 可配对，ICE 永远停在 checking，表现为“已协商但无画面”。
     let pc = PeerConnectionBuilder::new()
         .with_configuration(config)
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
         .with_handler(handler)
-        .with_udp_addrs(vec!["0.0.0.0:0"])
+        .with_udp_addrs(vec!["0.0.0.0:0", "[::]:0"])
         .build()
         .await
         .map_err(|e| format!("创建 PeerConnection 失败: {e}"))?;
