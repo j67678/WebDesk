@@ -47,12 +47,6 @@ pub struct ClientMessage {
     /// 心跳对账：客户端此刻仍按下的鼠标键编号
     #[serde(default)]
     pub buttons: Vec<i32>,
-    /// WebRTC offer SDP（type=offer）
-    #[serde(default)]
-    pub sdp: String,
-    /// 弱网自适应：客户端建议的目标码率（kbps，type=adapt）
-    #[serde(default)]
-    pub bitrate_kbps: u32,
 }
 
 impl ClientMessage {

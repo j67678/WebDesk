@@ -58,6 +58,15 @@
     letter-spacing: -.5px; white-space: nowrap;
   }
   #toolbar .logo span { color: #a78bfa; }
+  .toolbar-group { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  #toolbar input[type="text"], #toolbar input[type="number"] {
+    background: #0d1117; border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font-size: 14px; outline: none;
+    -webkit-user-select: text; user-select: text;
+  }
+  #toolbar input[type="text"]:focus, #toolbar input[type="number"]:focus { border-color: var(--accent); }
+  #toolbar input[type="text"] { width: 168px; min-width: 0; flex: 1 1 110px; }
+  #toolbar input[type="number"] { width: 76px; }
 
   .btn {
     min-height: 34px; padding: 6px 14px; border-radius: 8px; border: none;
@@ -96,9 +105,8 @@
   }
   body.fullscreen-mode #viewport { position: fixed; inset: 0; width: 100vw; height: 100vh; overflow: hidden; }
   #canvas-wrapper { position: relative; display: inline-block; flex-shrink: 0; margin: auto; cursor: none; touch-action: none; }
-  #screen-video { display: block; background: #111; touch-action: none; object-fit: fill; }
-  /* 用 transform 定位光标：只走合成层，不触发布局，拖动时不会强制同步重排 */
-  #remote-cursor { position: absolute; left: 0; top: 0; width: 16px; height: 16px; pointer-events: none; z-index: 10; transform: translate3d(-2px,-2px,0); will-change: transform; contain: layout style paint; }
+  #screen-canvas { display: block; image-rendering: auto; background: #111; touch-action: none; }
+  #remote-cursor { position: absolute; width: 16px; height: 16px; pointer-events: none; z-index: 10; transform: translate(-2px,-2px); }
 
   #overlay {
     position: absolute; inset: 0; display: flex; flex-direction: column;
@@ -183,6 +191,9 @@
     #toolbar { gap: 7px; padding: 6px 8px; }
     #toolbar .logo, #stats, label { display: none; }
     .btn { min-height: var(--tap); padding: 0 14px; font-size: 14px; }
+    #toolbar input[type="text"] { flex: 1 1 90px; width: auto; }
+    #toolbar input[type="number"] { width: 72px; min-height: var(--tap); }
+    .toolbar-group { flex: 1 1 100%; }
     #status-text { font-size: 12px; }
     #touchbar { display: block; }
     #remote-cursor { display: none; }
@@ -204,6 +215,11 @@
 <div id="toolbar">
   <div class="logo">🖥️ Web<span>Desk</span></div>
 
+  <div class="toolbar-group">
+    <input type="text" id="host" placeholder="主机地址" autocomplete="off" spellcheck="false">
+    <input type="number" id="port" value="8765" min="1" max="65535" inputmode="numeric">
+  </div>
+
   <button class="btn btn-primary" id="btn-connect">连接</button>
   <button class="btn btn-danger" id="btn-disconnect" disabled>断开</button>
   <button class="btn btn-secondary" id="btn-refresh" title="强制全屏刷新">🔄 <span class="short">刷新</span></button>
@@ -222,7 +238,7 @@
 
 <div id="viewport">
   <div id="canvas-wrapper">
-    <video id="screen-video" autoplay playsinline muted disablePictureInPicture controlsList="nodownload nofullscreen noremoteplayback"></video>
+    <canvas id="screen-canvas"></canvas>
     <svg id="remote-cursor" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
       <polygon points="1,1 1,13 4,10 7,15 9,14 6,9 10,9" fill="white" stroke="black" stroke-width="1"/>
     </svg>
@@ -230,7 +246,7 @@
   <div id="overlay">
     <div class="icon">🖥️</div>
     <div class="title">远程桌面</div>
-    <div class="subtitle">正在自动连接当前服务端…<br>触屏：单指轻点＝单击，拖动＝移动光标，长按＝右键，双指＝缩放 / 滚动。</div>
+    <div class="subtitle">输入服务端地址后点击「连接」。<br>触屏：单指轻点＝单击，拖动＝移动光标，长按＝右键，双指＝缩放 / 滚动。</div>
   </div>
 </div>
 
@@ -276,46 +292,23 @@
 <script>
 'use strict';
 
+/*__WEBDESK_BOOT__*/
+const BOOT = window.WEBDESK_BOOT || { port: 8765, autoConnect: false, serverInjected: false };
+
 // ── 状态 ───────────────────────────────────────────────────────────
 let ws = null;
-let pc = null;                          // RTCPeerConnection：仅 host candidate，IP 直连
 let remoteWidth = 1920, remoteHeight = 1080;
 let zoom = 1.0, manualZoom = false;
 let isConnected = false, requireAuth = false;
-let touchMode = 'tap';                  // tap | drag
-let frameCount = 0, byteCount = 0;
-let pendingMove = null, moveScheduled = false, lastKeyframeRequest = 0;
-// 弱网自适应状态：从 getStats() 累计丢包/收包，周期性建议服务端码率
-let lastRtcStats = { frames: 0, bytes: 0, lost: 0, received: 0 };
-let targetBitrateKbps = 2500, lastAdaptAt = 0;
-// 码率下限由服务端下发；低于该值桌面文字会明显模糊，弱网时宁可掉帧也不继续下探
-let minBitrateKbps = 1500, maxBitrateKbps = 8000, bitrateAtFloor = false;
-// 心跳对账：本端仍按下的键 / 鼠标键。服务端据此做差集释放。
-const pressedKeys = new Map(), pressedButtons = new Set();
-const keyId = (key, code) => (code || '') + '|' + key;
-function releaseAllLocal() {
-  pressedKeys.clear();
-  pressedButtons.clear();
-  send({ type: 'release_all' });
-}
-
-// 关键帧请求去抖：弱网丢包时请服务端立刻发 IDR
-function requestKeyframe() {
-  const now = performance.now();
-  if (now - lastKeyframeRequest > 800) {
-    lastKeyframeRequest = now;
-    send({ type: 'keyframe' });
-  }
-}
+let touchMode = 'tap';                 // tap | drag
+let frameCount = 0, tileCount = 0, byteCount = 0;
+let remoteTileSize = 64, decodeChain = Promise.resolve();
 let lastStatTime = performance.now(), latencyMs = 0, pingStart = 0;
 let statTimer = null, pingTimer = null, notifTimer = null;
 let lastMoveSent = 0;
 
 const $ = id => document.getElementById(id);
-const video = $('screen-video');
-// 兼容性回退：确保 Edge/Chromium 不显示原生画中画、下载、全屏、远程播放等悬浮按钮
-video.disablePictureInPicture = true;
-video.controlsList = 'nodownload nofullscreen noremoteplayback';
+const canvas = $('screen-canvas'), ctx = canvas.getContext('2d', { alpha: false });
 const overlay = $('overlay'), viewport = $('viewport'), wrapper = $('canvas-wrapper');
 const authDialog = $('auth-dialog'), authPassword = $('auth-password'), authError = $('auth-error');
 const rememberPassword = $('remember-password'), remoteCursor = $('remote-cursor');
@@ -342,64 +335,44 @@ function vibrate(ms) { if (navigator.vibrate) try { navigator.vibrate(ms); } cat
 
 // ── 连接管理 ───────────────────────────────────────────────────────
 function wsUrl() {
-  // 页面由服务端提供，直接连接当前页面的主机与端口（IPv6 已带方括号）
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${location.host}/ws`;
+  const hostInput = $('host').value.trim();
+  const port = $('port').value.trim() || String(BOOT.port || 8765);
+  let host = hostInput;
+  let usePort = port;
+  if (!host && BOOT.serverInjected) {
+    // 服务端注入时直接使用页面自身的 host（IPv6 已带方括号），避免地址猜测错误
+    host = location.host;
+    usePort = '';
+  }
+  if (!host) host = location.hostname || 'localhost';
+  if (host.startsWith('[')) {
+    const end = host.indexOf(']');
+    return `ws://${host.slice(0, end + 1)}${host.slice(end + 1).includes(':') ? '' : ':' + usePort}/ws`;
+  }
+  return `ws://${host}${usePort ? ':' + usePort : ''}/ws`;
 }
-
-let reconnectAttempts = 0, reconnectTimer = null, userDisconnect = false;
 
 function connect() {
   const url = wsUrl();
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) { try { ws.close(); } catch (e) {} }
-  closePeer();
-  userDisconnect = false;
   setStatus('connecting', '连接中…');
   notify('正在连接 ' + url);
   ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
 
-  ws.onopen = () => { reconnectAttempts = 0; setStatus('connecting', '信令已连接'); };
+  ws.onopen = () => { setStatus('connected', '已连接'); notify('连接成功，等待初始化…'); };
   ws.onclose = e => {
     isConnected = false; requireAuth = false;
-    closePeer();
     setStatus('error', `已断开 (${e.code})`);
     overlay.classList.remove('hidden');
     authDialog.classList.remove('show');
     $('btn-connect').disabled = false; $('btn-disconnect').disabled = true;
     stopTimers();
-    // 异常断开（非用户主动）自动重连，弱网抖动后自恢复；指数退避上限 10 秒
-    if (!userDisconnect && reconnectAttempts < 8) {
-      const delay = Math.min(10000, 800 * Math.pow(1.6, reconnectAttempts++));
-      setStatus('connecting', `重连中（${Math.round(delay / 1000)}s）…`);
-      reconnectTimer = setTimeout(connect, delay);
-    }
   };
-  ws.onerror = () => { setStatus('error', '连接错误'); notify('⚠️ 信令连接失败，请检查服务端'); };
+  ws.onerror = () => { setStatus('error', '连接错误'); notify('⚠️ WebSocket 连接失败，请检查服务端'); };
   ws.onmessage = onMessage;
 }
-
-function closePeer() {
-  if (pc) {
-    try { pc.close(); } catch (e) {}
-    pc = null;
-  }
-  if (video.srcObject) {
-    video.srcObject.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
-    video.srcObject = null;
-  }
-  // 重建连接后解码计数从 0 开始，重置基准避免停滞检测误判
-  lastRtcStats = { frames: 0, bytes: 0, lost: 0, received: 0 };
-  lastDecodedFrames = 0; decodedStallAt = 0; stallKeyframeAttempts = 0;
-  lastRcvLost = 0; lastRcvReceived = 0;
-}
-
-function disconnect() {
-  userDisconnect = true;
-  reconnectAttempts = 0;
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (ws) ws.close(1000, 'user disconnect');
-}
+function disconnect() { if (ws) ws.close(1000, 'user disconnect'); }
 
 function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -428,13 +401,14 @@ function submitAuth() {
 
 // ── 消息处理 ───────────────────────────────────────────────────────
 function onMessage(evt) {
+  // 画面帧走二进制，控制消息仍为 JSON 文本
+  if (evt.data instanceof ArrayBuffer) { onFrameBinary(evt.data); return; }
   let d; try { d = JSON.parse(evt.data); } catch (e) { return; }
 
   if (d.type === 'auth_result') {
     if (d.success) {
       authError.textContent = ''; authDialog.classList.remove('show');
-      notify('密码验证成功 ✓');
-      startWebRtc();
+      notify('密码验证成功 ✓'); activateConnection();
     } else {
       authError.textContent = d.message || '密码错误';
       authPassword.value = ''; authPassword.focus();
@@ -446,30 +420,16 @@ function onMessage(evt) {
 
   if (d.type === 'init') {
     if (d.require_auth) {
-      requireAuth = true; showAuthDialog(); return;   // 未认证时不建立 WebRTC
+      requireAuth = true; showAuthDialog(); return;   // 未认证时不建立画布
     }
     requireAuth = false;
-    if (Number.isFinite(d.min_bitrate_kbps) && d.min_bitrate_kbps > 0) {
-      minBitrateKbps = d.min_bitrate_kbps;
-    }
-    if (Number.isFinite(d.max_bitrate_kbps) && d.max_bitrate_kbps > 0) {
-      maxBitrateKbps = Math.max(d.max_bitrate_kbps, minBitrateKbps);
-    }
-    targetBitrateKbps = Math.min(maxBitrateKbps, Math.max(minBitrateKbps, targetBitrateKbps));
-    startWebRtc();
-    return;
-  }
-
-  if (d.type === 'answer') {
-    if (!pc) { notify('尚未创建 WebRTC 连接'); return; }
-    pc.setRemoteDescription({ type: 'answer', sdp: d.sdp })
-      .then(() => setStatus('connected', 'WebRTC 已协商'))
-      .catch(e => { setStatus('error', 'SDP 协商失败'); notify('⚠️ SDP 协商失败: ' + e); });
-    return;
-  }
-
-  if (d.type === 'error') {
-    setStatus('error', '协商失败'); notify('⚠️ ' + (d.message || '服务端错误'));
+    remoteWidth = d.width || remoteWidth;
+    remoteHeight = d.height || remoteHeight;
+    remoteTileSize = d.tile_size || remoteTileSize;
+    canvas.width = remoteWidth; canvas.height = remoteHeight;
+    ctx.fillStyle = '#111'; ctx.fillRect(0, 0, remoteWidth, remoteHeight);
+    fitToWindow();
+    activateConnection();
     return;
   }
 
@@ -477,226 +437,96 @@ function onMessage(evt) {
     if (pingStart > 0) { latencyMs = Math.round(performance.now() - pingStart); pingStart = 0; }
     return;
   }
+
 }
 
-// ── WebRTC：建立 host-only PeerConnection 并接收 H.264 视频 ────────
-async function startWebRtc() {
-  if (pc || !ws || ws.readyState !== WebSocket.OPEN) return;
-  setStatus('connecting', '建立视频连接…');
-  try {
-    // iceServers 为空 => 浏览器只收集 host candidate，纯 IP 直连
-    pc = new RTCPeerConnection({ iceServers: [] });
-
-    // 只接收视频：显式添加 recvonly transceiver，否则 offer 中没有 m= 段与 ICE 凭据
-    pc.addTransceiver('video', { direction: 'recvonly' });
-
-    pc.ontrack = e => {
-      // 把接收端抖动缓冲压到浏览器允许的最小值（支持的 Chromium 内核生效）
-      if (e.receiver && 'playoutDelayHint' in e.receiver) {
-        try { e.receiver.playoutDelayHint = 0; } catch (_) {}
-      }
-      if (e.streams && e.streams[0]) video.srcObject = e.streams[0];
-    };
-
-    pc.oniceconnectionstatechange = () => {
-      if (!pc) return;
-      const st = pc.iceConnectionState;
-      if (st === 'connected' || st === 'completed') {
-        setStatus('connected', '已连接');
-      } else if (st === 'disconnected') {
-        setStatus('connecting', '连接抖动，重连中…');
-      } else if (st === 'failed') {
-        setStatus('error', 'ICE 连接失败');
-        notify('⚠️ 直连失败：请确认在同一局域网且防火墙已放行');
-      }
-    };
-
-    video.onloadedmetadata = () => {
-      remoteWidth = video.videoWidth || remoteWidth;
-      remoteHeight = video.videoHeight || remoteHeight;
-      fitToWindow();
-      activateConnection();
-    };
-
-    const offer = await pc.createOffer();
-    // Chromium 私有 SDP 标记：关闭接收侧额外排队，局域网直连可少一整段缓冲延迟
-    if (offer.sdp && !offer.sdp.includes('x-google-flag:low-latency')) {
-      offer.sdp = offer.sdp.replace(/(^m=video[^\r\n]*\r?\n)/m, '$1a=x-google-flag:low-latency\r\n');
-    }
-    await pc.setLocalDescription(offer);
-
-    // non-trickle ICE：等收集完成再把完整 offer 发给服务端
-    if (pc.iceGatheringState !== 'complete') {
-      await new Promise(resolve => {
-        const check = () => {
-          if (!pc || pc.iceGatheringState === 'complete') {
-            if (pc) pc.removeEventListener('icegatheringstatechange', check);
-            resolve();
-          }
-        };
-        pc.addEventListener('icegatheringstatechange', check);
-        setTimeout(resolve, 3000);
-      });
-    }
-    if (!pc) return;
-    send({ type: 'offer', sdp: pc.localDescription.sdp });
-  } catch (e) {
-    setStatus('error', 'WebRTC 初始化失败');
-    notify('⚠️ WebRTC 初始化失败: ' + e);
-    closePeer();
+// ── 二进制画面帧 ───────────────────────────────────────────────────
+// 格式：u8 类型=1 | u16 矩形数 | 每块 [x,y,w,h u16][len u32][jpeg 字节]
+function onFrameBinary(buf) {
+  const view = new DataView(buf);
+  if (buf.byteLength < 3 || view.getUint8(0) !== 1) return;
+  const count = view.getUint16(1, true);
+  const rects = [];
+  let off = 3, bytes = 0;
+  for (let i = 0; i < count; i++) {
+    if (off + 12 > buf.byteLength) return;
+    const x = view.getUint16(off, true), y = view.getUint16(off + 2, true);
+    const w = view.getUint16(off + 4, true), h = view.getUint16(off + 6, true);
+    const len = view.getUint32(off + 8, true);
+    off += 12;
+    if (off + len > buf.byteLength) return;
+    rects.push({ x, y, w, h, bytes: new Uint8Array(buf, off, len) });
+    off += len;
+    bytes += len;
   }
+  frameCount++;
+  byteCount += bytes;
+  const ts = remoteTileSize || 64;
+  for (const r of rects) {
+    tileCount += Math.max(1, Math.round(r.w / ts)) * Math.max(1, Math.round(r.h / ts));
+  }
+  // 串行解码 + 绘制，避免旧帧的瓦片覆盖新画面
+  decodeChain = decodeChain
+    .then(() => drawRects(rects))
+    .catch(() => {});
 }
 
-// ── 弱网自适应：基于 WebRTC getStats() 的丢包率调整码率 ────────────
-async function collectRtcStats() {
-  if (!pc) return;
-  try {
-    const stats = await pc.getStats();
-    stats.forEach(r => {
-      if (r.type === 'inbound-rtp' && (r.kind === 'video' || r.mediaType === 'video')) {
-        const frames = r.framesDecoded || 0;
-        const bytes = r.bytesReceived || 0;
-        const lost = r.packetsLost || 0;
-        const received = r.packetsReceived || 0;
-        const recvDelta = Math.max(0, received - lastRtcStats.received);
-        frameCount += Math.max(0, frames - lastRtcStats.frames);
-        byteCount += Math.max(0, bytes - lastRtcStats.bytes) * 8; // bit
-        lastRtcStats = { frames, bytes, lost, received };
-
-        const now = performance.now();
-
-        // 解码停滞自救：有收包但无新解码帧时，可能是参考帧丢失导致解码器卡死。
-        // 关键帧采用递增退避（4s→8s→16s→30s）且最多请求 4 次；
-        // 连续请求 IDR 会放大拥塞，反而让画面一直冻结、带宽被占满。
-        if (frames > lastDecodedFrames) {
-          lastDecodedFrames = frames;
-          decodedStallAt = 0;
-          stallKeyframeAttempts = 0;
-        } else {
-          if (decodedStallAt === 0) decodedStallAt = now;
-          const backoffMs = Math.min(4000 * Math.pow(2, stallKeyframeAttempts), 30000);
-          // 完全收不到包（网络中断）时请求 IDR 无意义；已到码率下限时也不再请求。
-          if (now - decodedStallAt >= backoffMs && recvDelta > 0
-              && !bitrateAtFloor && stallKeyframeAttempts < 4) {
-            requestKeyframe();
-            stallKeyframeAttempts++;
-          }
-        }
-
-        if (now - lastAdaptAt >= 3000 && received > lastRcvReceived + 30) {
-          const lostDelta = Math.max(0, lost - lastRcvLost);
-          const rcvDelta = Math.max(0, received - lastRcvReceived);
-          lastRcvLost = lost; lastRcvReceived = received; lastAdaptAt = now;
-          const lossRate = lostDelta / Math.max(1, lostDelta + rcvDelta);
-          let next = targetBitrateKbps;
-          let shouldKeyframe = false;
-          if (lossRate > 0.05) {
-            if (targetBitrateKbps > minBitrateKbps) {
-              next = Math.max(minBitrateKbps, Math.round(targetBitrateKbps * 0.75));
-              // 只在真正降档时请求 IDR；已在下限时反复请求会放大拥塞。
-              shouldKeyframe = true;
-            }
-          } else if (lossRate < 0.01) {
-            next = Math.min(maxBitrateKbps, Math.round(targetBitrateKbps * 1.15));
-          }
-          bitrateAtFloor = next <= minBitrateKbps && lossRate > 0.05;
-          if (shouldKeyframe) requestKeyframe();
-          if (next !== targetBitrateKbps) {
-            targetBitrateKbps = next;
-            send({ type: 'adapt', bitrate_kbps: next });
-          }
-        } else if (received >= lastRcvReceived) {
-          lastRcvLost = lost; lastRcvReceived = received;
-        }
-      }
-    });
-  } catch (e) {}
+function drawRects(rects) {
+  return Promise.all(rects.map(r =>
+    createImageBitmap(new Blob([r.bytes], { type: 'image/jpeg' }))
+      .then(bmp => ({ bmp, r }), () => null)
+  )).then(items => {
+    for (const item of items) {
+      if (!item) continue;
+      try { ctx.drawImage(item.bmp, item.r.x, item.r.y, item.r.w, item.r.h); } catch (e) {}
+      item.bmp.close();
+    }
+  });
 }
-let lastRcvLost = 0, lastRcvReceived = 0;
-let lastDecodedFrames = 0, decodedStallAt = 0, stallKeyframeAttempts = 0;
 
 // ── 缩放 / 坐标 ────────────────────────────────────────────────────
-// 布局矩形缓存：pointermove 每秒可触发上百次，反复读 getBoundingClientRect
-// 会在刚写过光标样式后强制同步重排。只在缩放/滚动/窗口变化时失效。
-let videoRect = null;
-function invalidateVideoRect() { videoRect = null; }
-function getVideoRect() {
-  if (!videoRect) videoRect = video.getBoundingClientRect();
-  return videoRect;
-}
 function applyZoom(z) {
   zoom = Math.max(0.1, Math.min(6, z));
-  video.style.width = (remoteWidth * zoom) + 'px';
-  video.style.height = (remoteHeight * zoom) + 'px';
-  const cs = 16 * Math.min(zoom, 2);
-  remoteCursor.style.width = cs + 'px';
-  remoteCursor.style.height = cs + 'px';
-  invalidateVideoRect();
+  canvas.style.width = (remoteWidth * zoom) + 'px';
+  canvas.style.height = (remoteHeight * zoom) + 'px';
+  remoteCursor.style.width = (16 * Math.min(zoom, 2)) + 'px';
+  remoteCursor.style.height = (16 * Math.min(zoom, 2)) + 'px';
 }
 function fitToWindow() {
   manualZoom = false;
-  if (!remoteWidth || !remoteHeight) return;
   const vw = viewport.clientWidth - 2, vh = viewport.clientHeight - 2;
   applyZoom(Math.min(vw / remoteWidth, vh / remoteHeight));
 }
 function toRemote(clientX, clientY) {
-  const r = getVideoRect();
+  const r = canvas.getBoundingClientRect();
   return {
     x: Math.max(0, Math.min(remoteWidth - 1, Math.round((clientX - r.left) * remoteWidth / r.width))),
     y: Math.max(0, Math.min(remoteHeight - 1, Math.round((clientY - r.top) * remoteHeight / r.height)))
   };
 }
 function updateCursor(cx, cy) {
-  const r = getVideoRect();
-  remoteCursor.style.transform =
-    'translate3d(' + (cx - r.left).toFixed(1) + 'px,' + (cy - r.top).toFixed(1) + 'px,0) translate(-2px,-2px)';
-}
-// 点击 / 滚轮前把尚未发出的移动立即补发，避免在旧位置触发操作
-function flushMove() {
-  if (!pendingMove || !isConnected) { pendingMove = null; return; }
-  send({ type: 'mousemove', x: pendingMove.x, y: pendingMove.y, button: pendingMove.button });
-  pendingMove = null;
+  const r = canvas.getBoundingClientRect();
+  remoteCursor.style.left = (cx - r.left) + 'px';
+  remoteCursor.style.top = (cy - r.top) + 'px';
 }
 
 // ── 鼠标 / 触控笔（桌面） ──────────────────────────────────────────
 wrapper.addEventListener('pointerdown', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
   e.preventDefault();
-  flushMove();
   const p = toRemote(e.clientX, e.clientY);
-  updateCursor(e.clientX, e.clientY);
   send({ type: 'mousedown', x: p.x, y: p.y, button: e.button });
-  pressedButtons.add(e.button);
   wrapper.setPointerCapture(e.pointerId);
 });
 wrapper.addEventListener('pointermove', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
   const p = toRemote(e.clientX, e.clientY);
   updateCursor(e.clientX, e.clientY);
-  if (pressedButtons.size > 0) {
-    // 按住拖动窗口时每一条 pointermove 立即发出：等 rAF 会额外引入一帧
-    // （解码繁忙时可达 30ms+）延迟，且此时事件本身已被浏览器合并过。
-    pendingMove = null;
-    send({ type: 'mousemove', x: p.x, y: p.y, button: e.button });
-    return;
-  }
-  // 未按下时合并到下一动画帧，避免空闲高频鼠标刷屏
-  pendingMove = { x: p.x, y: p.y, button: e.button };
-  if (!moveScheduled) {
-    moveScheduled = true;
-    requestAnimationFrame(() => {
-      moveScheduled = false;
-      if (!pendingMove || !isConnected) return;
-      send({ type: 'mousemove', x: pendingMove.x, y: pendingMove.y, button: pendingMove.button });
-      pendingMove = null;
-    });
-  }
+  send({ type: 'mousemove', x: p.x, y: p.y, button: e.button });
 });
 wrapper.addEventListener('pointerup', e => {
   if (e.pointerType === 'touch' || !isConnected) return;
   e.preventDefault();
-  flushMove();
-  pressedButtons.delete(e.button);
   const p = toRemote(e.clientX, e.clientY);
   send({ type: 'mouseup', x: p.x, y: p.y, button: e.button });
 });
@@ -704,7 +534,6 @@ wrapper.addEventListener('contextmenu', e => e.preventDefault());
 wrapper.addEventListener('wheel', e => {
   if (!isConnected) return;
   e.preventDefault();
-  flushMove();
   const p = toRemote(e.clientX, e.clientY);
   send({ type: 'wheel', x: p.x, y: p.y, deltaX: e.deltaX, deltaY: e.deltaY });
 }, { passive: false });
@@ -732,7 +561,6 @@ wrapper.addEventListener('touchstart', e => {
     send({ type: 'mousemove', x: p.x, y: p.y });
     if (touchMode === 'drag') {
       send({ type: 'mousedown', x: p.x, y: p.y, button: 0 }); T.dragDown = true;
-      pressedButtons.add(0);
     } else {
       clearLongPress();
       T.longTimer = setTimeout(() => {
@@ -747,7 +575,7 @@ wrapper.addEventListener('touchstart', e => {
     }
   } else if (e.touches.length >= 2) {
     clearLongPress();
-    if (T.dragDown) { const p = toRemote(T.lastX, T.lastY); send({ type: 'mouseup', x: p.x, y: p.y, button: 0 }); T.dragDown = false; pressedButtons.delete(0); }
+    if (T.dragDown) { const p = toRemote(T.lastX, T.lastY); send({ type: 'mouseup', x: p.x, y: p.y, button: 0 }); T.dragDown = false; }
     T.active = true; T.mode = 'pinch'; T.longFired = true;
     T.startDist = dist(e.touches[0], e.touches[1]) || 1;
     T.startZoom = zoom;
@@ -783,7 +611,7 @@ wrapper.addEventListener('touchmove', e => {
       T.moved = true; clearLongPress();
     }
     const now = performance.now();
-    if (now - lastMoveSent < 4) return;       // 拖动节流收紧到 4ms，跟手优先
+    if (now - lastMoveSent < 16) return;      // 节流，避免弱网洪泛
     lastMoveSent = now;
     const p = toRemote(t.clientX, t.clientY);
     send({ type: 'mousemove', x: p.x, y: p.y, button: T.dragDown ? 0 : 0 });
@@ -798,7 +626,6 @@ function endTouch(e) {
     const p = toRemote(T.lastX, T.lastY);
     if (T.dragDown) {
       send({ type: 'mouseup', x: p.x, y: p.y, button: 0 });
-      pressedButtons.delete(0);
     } else if (!T.moved) {
       const now = performance.now();
       const isDouble = now - T.lastTap < 320 && Math.hypot(p.x - T.lastTapX, p.y - T.lastTapY) < 40;
@@ -835,10 +662,8 @@ document.addEventListener('keydown', e => {
   if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); return; }
   if (e.key !== 'F5') e.preventDefault();
   send({ type: 'keydown', key: e.key, code: e.code, modifiers: activeModifiers(e) });
-  pressedKeys.set(keyId(e.key, e.code), { key: e.key, code: e.code });
 }, { passive: false });
 document.addEventListener('keyup', e => {
-  pressedKeys.delete(keyId(e.key, e.code));
   if (!isConnected || authDialog.classList.contains('show')) return;
   if (e.target instanceof HTMLInputElement) return;
   if (e.key === 'F11') return;
@@ -924,9 +749,6 @@ document.addEventListener('fullscreenchange', () => {
   if (!manualZoom) fitToWindow();
   else applyZoom(zoom);
 });
-// 失焦 / 切后台时释放本端记录的全部按键，避免服务端残留按下状态
-window.addEventListener('blur', releaseAllLocal);
-document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAllLocal(); });
 
 // ── 统计 ───────────────────────────────────────────────────────────
 function activateConnection() {
@@ -938,7 +760,7 @@ function activateConnection() {
 function stopTimers() {
   clearInterval(statTimer); clearInterval(pingTimer);
   statTimer = pingTimer = null;
-  frameCount = byteCount = 0; latencyMs = 0; pingStart = 0;
+  frameCount = tileCount = byteCount = 0; latencyMs = 0; pingStart = 0;
   $('stat-fps').textContent = 'FPS: -'; $('stat-tiles').textContent = 'Tiles: -';
   $('stat-bw').textContent = 'BW: -'; $('stat-latency').textContent = '延迟: -';
 }
@@ -946,44 +768,47 @@ function startTimers() {
   stopTimers(); lastStatTime = performance.now();
   pingTimer = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN && pingStart === 0) {
-      pingStart = performance.now();
-      // 附带当前真实按下的键与鼠标键，服务端据此释放残留按键
-      send({
-        type: 'ping',
-        keys: [...pressedKeys.values()],
-        buttons: [...pressedButtons]
-      });
+      pingStart = performance.now(); send({ type: 'ping' });
     }
   }, 1000);
   statTimer = setInterval(() => {
     const now = performance.now(), dt = Math.max(0.001, (now - lastStatTime) / 1000);
     lastStatTime = now;
-    collectRtcStats();
     $('stat-fps').textContent = 'FPS: ' + (frameCount / dt).toFixed(1);
-    $('stat-tiles').textContent = '目标: ' + targetBitrateKbps + 'kbps'
-      + (bitrateAtFloor ? ' (已触底)' : '');
+    $('stat-tiles').textContent = 'Tiles/s: ' + (tileCount / dt).toFixed(0);
     $('stat-bw').textContent = 'BW: ' + (byteCount / dt / 1024).toFixed(0) + 'KB/s';
     $('stat-latency').textContent = '延迟: ' + latencyMs + 'ms';
-    frameCount = byteCount = 0;
+    frameCount = tileCount = byteCount = 0;
   }, 1000);
 }
 
 // ── 初始化 ─────────────────────────────────────────────────────────
 $('btn-connect').addEventListener('click', connect);
 $('btn-disconnect').addEventListener('click', disconnect);
-$('btn-refresh').addEventListener('click', () => { requestKeyframe(); notify('已请求关键帧刷新'); });
+$('btn-refresh').addEventListener('click', () => { send({ type: 'request_full' }); notify('已请求全屏刷新'); });
 $('btn-fullscreen').addEventListener('click', toggleFullscreen);
 $('auth-submit').addEventListener('click', submitAuth);
 $('auth-cancel').addEventListener('click', () => { authDialog.classList.remove('show'); disconnect(); });
 authPassword.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitAuth(); } });
+$('host').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+$('port').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
 
-viewport.addEventListener('scroll', invalidateVideoRect, { passive: true });
-window.addEventListener('resize', () => { invalidateVideoRect(); if (!manualZoom) fitToWindow(); });
-window.addEventListener('orientationchange', () => setTimeout(() => { invalidateVideoRect(); if (!manualZoom) fitToWindow(); }, 250));
+$('host').placeholder = location.hostname || 'localhost';
+$('port').value = BOOT.port || 8765;
+if (!BOOT.serverInjected) {
+  const savedHost = store.get('rdp_host', '');
+  if (savedHost) $('host').value = savedHost;
+}
+$('host').addEventListener('change', e => store.set('rdp_host', e.target.value.trim()));
 
-video.width = 1920; video.height = 1080;
+window.addEventListener('resize', () => { if (!manualZoom) fitToWindow(); });
+window.addEventListener('orientationchange', () => setTimeout(() => { if (!manualZoom) fitToWindow(); }, 250));
 
-setTimeout(connect, 60);
+canvas.width = 1920; canvas.height = 1080;
+ctx.fillStyle = '#111'; ctx.fillRect(0, 0, 1920, 1080);
+fitToWindow();
+
+if (BOOT.autoConnect) setTimeout(connect, 60);
 </script>
 </body>
 </html>
