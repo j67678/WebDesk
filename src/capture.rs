@@ -185,6 +185,9 @@ pub fn merge_dirty_rects(
 }
 
 /// 容差哈希：每通道丢弃低 2 位（等价于约 3 级色差阈值），抑制压缩/光标噪声。
+///
+/// 必须逐行逐列扫描，不能隔行/隔列采样：Excel 网格线、文本下划线等
+/// 1 像素细线若落在未采样的行/列上，哈希不变会导致差分漏检、画面缺线。
 fn tile_hash(frame: &Frame<'_>, x: u32, y: u32, w: u32, h: u32) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let stride = frame.width as usize * 4;
@@ -200,9 +203,9 @@ fn tile_hash(frame: &Frame<'_>, x: u32, y: u32, w: u32, h: u32) -> u64 {
                     hash = (hash ^ v).wrapping_mul(0x0000_0100_0000_01b3);
                 }
             }
-            cx += 2; // 横向隔点采样
+            cx += 1;
         }
-        ry += 2; // 纵向隔行采样
+        ry += 1;
     }
     hash
 }
